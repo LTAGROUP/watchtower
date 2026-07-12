@@ -1,0 +1,75 @@
+services:
+  watchtower:
+    build: .
+    image: watchtower:local
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - watchtower-data:/data
+    networks: [media]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  mount:
+    image: rclone/rclone:1.69
+    restart: unless-stopped
+    depends_on:
+      watchtower:
+        condition: service_healthy
+    command:
+      - mount
+      - ":webdav:"
+      - /media
+      - --webdav-url=http://watchtower:8080/dav/
+      - --webdav-vendor=other
+      - --allow-other
+      - --read-only
+      - --vfs-cache-mode=off
+      - --dir-cache-time=30s
+      - --poll-interval=0
+      - --log-level=INFO
+    cap_add: [SYS_ADMIN]
+    devices: [/dev/fuse:/dev/fuse]
+    security_opt: [apparmor:unconfined]
+    volumes:
+      - type: bind
+        source: ${MEDIA_MOUNT:-./mnt}
+        target: /media
+        bind:
+          propagation: rshared
+    networks: [media]
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    profiles: [bundled]
+    restart: unless-stopped
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      - prowlarr-data:/config
+    ports: ["9696:9696"]
+    networks: [media]
+
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    profiles: [bundled]
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      - seerr-data:/app/config
+    ports: ["5055:5055"]
+    networks: [media]
+
+networks:
+  media:
+
+volumes:
+  watchtower-data:
+  prowlarr-data:
+  seerr-data:

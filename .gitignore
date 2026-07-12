@@ -1,0 +1,6 @@
+.env
+mnt/
+data/
+*.log
+.DS_Store
+

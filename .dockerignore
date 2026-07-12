@@ -1,0 +1,7 @@
+.git
+.env
+mnt
+data
+work
+outputs
+*.log
