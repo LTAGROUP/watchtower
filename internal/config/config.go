@@ -9,6 +9,8 @@ import (
 
 type Config struct {
 	ListenAddr, DataFile                       string
+	DashboardAddr, DashboardUsername           string
+	DashboardPassword, SettingsFile            string
 	PublicBaseURL, WebhookSecret               string
 	SeerrURL, SeerrAPIKey                      string
 	TorBoxToken, AllDebridToken                string
@@ -22,6 +24,8 @@ type Config struct {
 func Load() Config {
 	return Config{
 		ListenAddr: env("LISTEN_ADDR", ":8080"), DataFile: env("DATA_FILE", "/data/state.json"),
+		DashboardAddr: env("DASHBOARD_ADDR", ":3001"), DashboardUsername: env("DASHBOARD_USERNAME", "admin"),
+		DashboardPassword: env("DASHBOARD_PASSWORD", "watchtower"), SettingsFile: env("SETTINGS_FILE", "/data/settings.json"),
 		PublicBaseURL: strings.TrimRight(env("PUBLIC_BASE_URL", "http://watchtower:8080"), "/"),
 		WebhookSecret: os.Getenv("WEBHOOK_SECRET"),
 		SeerrURL:      strings.TrimRight(os.Getenv("SEERR_URL"), "/"), SeerrAPIKey: os.Getenv("SEERR_API_KEY"),

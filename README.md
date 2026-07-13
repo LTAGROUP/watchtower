@@ -17,6 +17,7 @@ This project is intended for media you are authorized to access. It does not byp
 - automatic URL regeneration and retry after stale links, rate limits, timeouts, and provider 5xx responses
 - persistent JSON metadata with atomic updates; no media payload storage
 - a read-only WebDAV-to-FUSE mount using rclone
+- an authenticated operations dashboard for requests, discovery, library files, queue state, retries, and live settings
 
 ## Data flow
 
@@ -53,6 +54,10 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
    ```sh
    docker compose --profile bundled up -d --build
    ```
+
+   Open `http://localhost:3001` and sign in with `DASHBOARD_USERNAME` and
+   `DASHBOARD_PASSWORD`. Both values are configured in `.env`; change the example
+   password before exposing the dashboard beyond your local network.
 
 5. Add `${MEDIA_MOUNT}/Movies` and `${MEDIA_MOUNT}/TV` as Plex library roots. If Plex itself runs in Docker, bind the same host path into its container with `rslave` or `rshared` propagation.
 
@@ -96,6 +101,11 @@ The core port is intentionally not published. Add `ports: ["8080:8080"]` under `
 
 Tokens remain in `.env` and are never included in the persisted library metadata or WebDAV paths. The TorBox playback token is sent only to TorBox; the generated URL remains in memory. AllDebrid links are unlocked on demand and likewise remain in memory.
 
+Dashboard edits are stored in `/data/settings.json` in the existing
+`watchtower-data` volume and take effect without a container rebuild. Secret
+values can be replaced from the settings page but are never returned to the
+browser after saving. Environment values are used as the initial defaults.
+
 ## Operational notes
 
 - The mount container needs `SYS_ADMIN`, `/dev/fuse`, and an unconfined AppArmor profile solely for its FUSE mount. The WatchTower process itself runs unprivileged.
@@ -127,4 +137,4 @@ docker build -t watchtower .
 docker compose config
 ```
 
-Useful endpoints inside the Compose network are `GET /healthz`, `GET /api/v1/library`, `PROPFIND /dav/`, and `POST /webhooks/seerr`. Polling is authoritative; the webhook endpoint is available as a lightweight authenticated wake-up target for a later event-driven implementation.
+Useful core endpoints inside the Compose network are `GET /healthz`, `GET /api/v1/library`, `PROPFIND /dav/`, and `POST /webhooks/seerr`. The Basic-authenticated dashboard and its control API are published on port 3001. Polling is authoritative; the webhook endpoint is available as a lightweight authenticated wake-up target for a later event-driven implementation.

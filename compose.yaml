@@ -6,6 +6,8 @@ services:
     env_file:
       - path: .env
         required: false
+    ports:
+      - "${DASHBOARD_PORT:-3001}:3001"
     volumes:
       - watchtower-data:/data
     networks: [media]

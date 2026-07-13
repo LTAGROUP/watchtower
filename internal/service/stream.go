@@ -10,18 +10,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LTAGROUP/watchtower/internal/config"
 	"github.com/LTAGROUP/watchtower/internal/debrid"
 	"github.com/LTAGROUP/watchtower/internal/model"
 	"github.com/LTAGROUP/watchtower/internal/store"
 )
 
 type Streamer struct {
-	Store     *store.Store
-	Providers map[string]debrid.Provider
-	Client    *http.Client
-	TTL       time.Duration
-	Log       *slog.Logger
-	mu        sync.Mutex
+	Store           *store.Store
+	Providers       map[string]debrid.Provider
+	ProviderFactory func(config.Config) map[string]debrid.Provider
+	Settings        func() config.Config
+	Client          *http.Client
+	TTL             time.Duration
+	Log             *slog.Logger
+	mu              sync.Mutex
 }
 
 func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) {
@@ -118,7 +121,16 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 	if s.Log != nil {
 		s.Log.Info("stream link refresh started", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason)
 	}
-	p := s.Providers[current.Provider]
+	providers := s.Providers
+	ttl := s.TTL
+	if s.Settings != nil {
+		cfg := s.Settings()
+		ttl = cfg.StreamURLTTL
+		if s.ProviderFactory != nil {
+			providers = s.ProviderFactory(cfg)
+		}
+	}
+	p := providers[current.Provider]
 	if p == nil {
 		return "", fmt.Errorf("provider %q unavailable", current.Provider)
 	}
@@ -129,10 +141,10 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		}
 		return "", e
 	}
-	expires := time.Now().Add(s.TTL)
+	expires := time.Now().Add(ttl)
 	s.Store.SetStream(current.ID, u, expires)
 	if s.Log != nil {
-		s.Log.Info("stream link obtained", "component", "stream", "file", current.Path, "provider", current.Provider, "valid_for", s.TTL.String())
+		s.Log.Info("stream link obtained", "component", "stream", "file", current.Path, "provider", current.Provider, "valid_for", ttl.String())
 	}
 	return u, nil
 }

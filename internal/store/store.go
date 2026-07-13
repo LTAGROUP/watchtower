@@ -125,3 +125,28 @@ func (s *Store) Media() []*model.Media {
 	}
 	return out
 }
+
+func (s *Store) ResetMedia(id int64) (*model.Media, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.state.Media[id]
+	if m == nil {
+		return nil, os.ErrNotExist
+	}
+	for fileID, f := range s.state.Files {
+		if f.MediaID == id {
+			delete(s.state.Files, fileID)
+		}
+	}
+	delete(s.state.ProcessedRequests, m.RequestID)
+	m.Status = "queued"
+	m.Error = ""
+	m.ScrapedAt = time.Time{}
+	m.UpdatedAt = time.Now().UTC()
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	copy := *m
+	copy.Seasons = append([]int(nil), m.Seasons...)
+	return &copy, nil
+}

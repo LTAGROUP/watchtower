@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 
 type Seerr struct {
 	Config   config.Config
+	Settings func() config.Config
 	Store    *store.Store
 	Resolver *Resolver
 	Client   *http.Client
@@ -56,11 +58,12 @@ type details struct {
 
 func (s *Seerr) Run(ctx context.Context) {
 	s.poll(ctx)
-	t := time.NewTicker(s.Config.PollInterval)
-	defer t.Stop()
 	for {
+		wait := s.currentConfig().PollInterval
+		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return
 		case <-t.C:
 			s.poll(ctx)
@@ -68,10 +71,14 @@ func (s *Seerr) Run(ctx context.Context) {
 	}
 }
 func (s *Seerr) poll(ctx context.Context) {
+	cfg := s.currentConfig()
+	if cfg.SeerrURL == "" || cfg.SeerrAPIKey == "" {
+		return
+	}
 	started := time.Now()
 	s.Log.Info("seerr poll started", "component", "seerr")
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.Config.SeerrURL+"/api/v1/request?take=100&skip=0&sort=added", nil)
-	req.Header.Set("X-Api-Key", s.Config.SeerrAPIKey)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, cfg.SeerrURL+"/api/v1/request?take=100&skip=0&sort=added", nil)
+	req.Header.Set("X-Api-Key", cfg.SeerrAPIKey)
 	resp, e := s.Client.Do(req)
 	if e != nil {
 		s.Log.Error("seerr poll", "error", e)
@@ -151,9 +158,10 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	s.Log.Info("seerr request processing completed", "component", "seerr", "request", x.ID, "title", title, "status", m.Status, "duration", time.Since(started).String())
 }
 func (s *Seerr) details(ctx context.Context, kind string, id int64) (details, error) {
-	u := fmt.Sprintf("%s/api/v1/%s/%d", s.Config.SeerrURL, kind, id)
+	cfg := s.currentConfig()
+	u := fmt.Sprintf("%s/api/v1/%s/%d", cfg.SeerrURL, kind, id)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	req.Header.Set("X-Api-Key", s.Config.SeerrAPIKey)
+	req.Header.Set("X-Api-Key", cfg.SeerrAPIKey)
 	resp, e := s.Client.Do(req)
 	if e != nil {
 		return details{}, e
@@ -167,9 +175,10 @@ func (s *Seerr) details(ctx context.Context, kind string, id int64) (details, er
 	return d, e
 }
 func (s *Seerr) markAvailable(ctx context.Context, id int64) {
-	u := s.Config.SeerrURL + "/api/v1/media/" + strconv.FormatInt(id, 10) + "/available"
+	cfg := s.currentConfig()
+	u := cfg.SeerrURL + "/api/v1/media/" + strconv.FormatInt(id, 10) + "/available"
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(url.Values{}.Encode()))
-	req.Header.Set("X-Api-Key", s.Config.SeerrAPIKey)
+	req.Header.Set("X-Api-Key", cfg.SeerrAPIKey)
 	resp, e := s.Client.Do(req)
 	if e != nil {
 		s.Log.Warn("seerr availability update failed", "component", "seerr", "media", id, "error", e)
@@ -181,6 +190,129 @@ func (s *Seerr) markAvailable(ctx context.Context, id int64) {
 	} else {
 		s.Log.Warn("seerr availability update rejected", "component", "seerr", "media", id, "status", resp.Status)
 	}
+}
+
+type DiscoverOptions struct {
+	Query, MediaType, Genre, Year, Sort string
+	Page                                int
+}
+
+type CreateRequestInput struct {
+	MediaType string `json:"mediaType"`
+	MediaID   int64  `json:"mediaId"`
+	Seasons   []int  `json:"seasons,omitempty"`
+	Is4K      bool   `json:"is4k"`
+}
+
+func (s *Seerr) Discover(ctx context.Context, options DiscoverOptions) (json.RawMessage, error) {
+	cfg := s.currentConfig()
+	if cfg.SeerrURL == "" || cfg.SeerrAPIKey == "" {
+		return nil, fmt.Errorf("Seerr is not configured")
+	}
+	page := options.Page
+	if page < 1 {
+		page = 1
+	}
+	values := url.Values{"page": {strconv.Itoa(page)}}
+	var endpoint string
+	if strings.TrimSpace(options.Query) != "" {
+		endpoint = "/api/v1/search"
+		values.Set("query", strings.TrimSpace(options.Query))
+	} else {
+		kind := "movies"
+		if strings.EqualFold(options.MediaType, "tv") {
+			kind = "tv"
+		}
+		endpoint = "/api/v1/discover/" + kind
+		if options.Genre != "" {
+			values.Set("genre", options.Genre)
+		}
+		if options.Sort != "" {
+			values.Set("sortBy", options.Sort)
+		}
+		if len(options.Year) == 4 {
+			if kind == "tv" {
+				values.Set("firstAirDateGte", options.Year+"-01-01")
+				values.Set("firstAirDateLte", options.Year+"-12-31")
+			} else {
+				values.Set("primaryReleaseDateGte", options.Year+"-01-01")
+				values.Set("primaryReleaseDateLte", options.Year+"-12-31")
+			}
+		}
+	}
+	return s.seerrJSON(ctx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
+}
+
+func (s *Seerr) CreateRequest(ctx context.Context, input CreateRequestInput) (json.RawMessage, error) {
+	if input.MediaID <= 0 || (input.MediaType != "movie" && input.MediaType != "tv") {
+		return nil, fmt.Errorf("mediaId and a movie or tv mediaType are required")
+	}
+	if input.MediaType == "tv" && len(input.Seasons) == 0 {
+		return nil, fmt.Errorf("choose at least one season")
+	}
+	body, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	return s.seerrJSON(ctx, http.MethodPost, "/api/v1/request", body)
+}
+
+func (s *Seerr) Retry(ctx context.Context, item *model.Media) error {
+	if _, loaded := s.inflight.LoadOrStore(item.RequestID, struct{}{}); loaded {
+		return fmt.Errorf("media is already being processed")
+	}
+	defer s.inflight.Delete(item.RequestID)
+	if err := s.Resolver.Resolve(ctx, item); err != nil {
+		return err
+	}
+	if item.Status == "ready" || item.Status == "partial" {
+		if err := s.Store.MarkProcessed(item.RequestID); err != nil {
+			return err
+		}
+		s.markAvailable(ctx, item.ID)
+	}
+	return nil
+}
+
+func (s *Seerr) seerrJSON(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
+	cfg := s.currentConfig()
+	if cfg.SeerrURL == "" || cfg.SeerrAPIKey == "" {
+		return nil, fmt.Errorf("Seerr is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, cfg.SeerrURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Api-Key", cfg.SeerrAPIKey)
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var raw json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("Seerr returned %s", resp.Status)
+	}
+	if resp.StatusCode/100 != 2 {
+		var detail struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(raw, &detail) == nil && detail.Message != "" {
+			return nil, fmt.Errorf("%s", detail.Message)
+		}
+		return nil, fmt.Errorf("Seerr returned %s", resp.Status)
+	}
+	return raw, nil
+}
+
+func (s *Seerr) currentConfig() config.Config {
+	if s.Settings != nil {
+		return s.Settings()
+	}
+	return s.Config
 }
 func yearOf(s string) int {
 	if len(s) >= 4 {

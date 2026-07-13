@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0d12">
+  <title>WatchTower Console</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#dashboard" aria-label="WatchTower dashboard">
+        <span class="brand-mark"><i></i></span>
+        <span><strong>WatchTower</strong><small>Media operations</small></span>
+      </a>
+      <nav class="nav" aria-label="Main navigation">
+        <a href="#dashboard" data-route="dashboard"><span class="nav-icon">⌂</span>Overview</a>
+        <a href="#discover" data-route="discover"><span class="nav-icon">⌕</span>Discover</a>
+        <a href="#library" data-route="library"><span class="nav-icon">▦</span>Library</a>
+        <a href="#queue" data-route="queue"><span class="nav-icon">↻</span>Queue <b id="queue-badge">0</b></a>
+        <a href="#settings" data-route="settings"><span class="nav-icon">⚙</span>Settings</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="system-dot"></span>
+        <div><strong id="system-status">Checking system</strong><small>Core service</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="page-eyebrow">Operations</p>
+          <h1 id="page-title">Overview</h1>
+        </div>
+        <div class="top-actions">
+          <span class="last-sync" id="last-sync">Not synced</span>
+          <button class="button ghost" id="refresh-button">Refresh</button>
+          <a class="button primary" href="#discover">Request media</a>
+        </div>
+      </header>
+
+      <div id="notice" class="notice" role="status" aria-live="polite"></div>
+
+      <section class="page active" id="dashboard-page">
+        <div class="hero-panel">
+          <div>
+            <span class="live-label"><i></i> Pipeline live</span>
+            <h2>Your media flow, at a glance.</h2>
+            <p>Track every title from discovery through scrape, resolution, and Plex-ready files.</p>
+          </div>
+          <a href="#queue" class="text-link">Inspect active queue <span>→</span></a>
+        </div>
+        <div class="metric-grid" id="metric-grid">
+          <article class="metric-card skeleton"></article><article class="metric-card skeleton"></article>
+          <article class="metric-card skeleton"></article><article class="metric-card skeleton"></article>
+        </div>
+        <div class="dashboard-grid">
+          <article class="panel pipeline-panel">
+            <div class="panel-head"><div><p class="kicker">Pipeline health</p><h3>Current status</h3></div><span class="muted" id="pipeline-total">—</span></div>
+            <div id="pipeline-bars" class="pipeline-bars"></div>
+          </article>
+          <article class="panel recent-panel">
+            <div class="panel-head"><div><p class="kicker">Latest activity</p><h3>Recently updated</h3></div><a href="#library" class="text-link small">View all</a></div>
+            <div id="recent-list" class="recent-list empty-state">Loading activity…</div>
+          </article>
+        </div>
+      </section>
+
+      <section class="page" id="discover-page">
+        <div class="section-intro">
+          <div><h2>Find something worth watching.</h2><p>Explore Seerr’s catalog, narrow the field, then send a request directly into your pipeline.</p></div>
+        </div>
+        <form class="filter-bar" id="discover-form">
+          <label class="search-field"><span>⌕</span><input id="discover-query" type="search" placeholder="Search titles, people, collections…" autocomplete="off"></label>
+          <label><span>Type</span><select id="discover-type"><option value="movie">Movies</option><option value="tv">TV shows</option></select></label>
+          <label><span>Genre</span><select id="discover-genre"><option value="">All genres</option><option value="28">Action</option><option value="12">Adventure</option><option value="16">Animation</option><option value="35">Comedy</option><option value="80">Crime</option><option value="99">Documentary</option><option value="18">Drama</option><option value="14">Fantasy</option><option value="27">Horror</option><option value="878">Science fiction</option><option value="53">Thriller</option></select></label>
+          <label><span>Year</span><input id="discover-year" inputmode="numeric" maxlength="4" placeholder="Any year"></label>
+          <label><span>Sort</span><select id="discover-sort"><option value="popularity.desc">Most popular</option><option value="vote_average.desc">Highest rated</option><option value="primary_release_date.desc">Newest first</option></select></label>
+          <button class="button primary" type="submit">Explore</button>
+        </form>
+        <div class="results-head"><p id="discover-count">Popular right now</p><div class="pagination"><button id="prev-page" class="icon-button" aria-label="Previous page">←</button><span id="page-count">Page 1</span><button id="next-page" class="icon-button" aria-label="Next page">→</button></div></div>
+        <div id="discover-grid" class="poster-grid"></div>
+      </section>
+
+      <section class="page" id="library-page">
+        <div class="section-intro row">
+          <div><h2>Your indexed library.</h2><p>Browse tracked titles or inspect the exact files exposed to Plex.</p></div>
+          <label class="compact-search"><span>⌕</span><input id="library-search" type="search" placeholder="Filter library"></label>
+        </div>
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-library-tab="media">Media <span id="media-tab-count">0</span></button>
+          <button class="tab" data-library-tab="files">Files <span id="files-tab-count">0</span></button>
+        </div>
+        <div class="table-card">
+          <div class="table-scroll"><table><thead id="library-head"></thead><tbody id="library-body"></tbody></table></div>
+        </div>
+      </section>
+
+      <section class="page" id="queue-page">
+        <div class="section-intro row"><div><h2>Resolution queue.</h2><p>Active, partial, and failed work stays visible until it is ready.</p></div><button class="button ghost" id="retry-failed">Retry all failed</button></div>
+        <div class="queue-summary" id="queue-summary"></div>
+        <div id="queue-list" class="queue-list"></div>
+      </section>
+
+      <section class="page" id="settings-page">
+        <div class="section-intro"><div><h2>Runtime settings.</h2><p>Changes are saved in the data volume and take effect without rebuilding the container.</p></div></div>
+        <form id="settings-form" class="settings-layout">
+          <article class="panel settings-section">
+            <div class="panel-head"><div><p class="kicker">Connection</p><h3>Seerr</h3></div><span id="seerr-state" class="connection-pill">Checking</span></div>
+            <div class="field-grid">
+              <label class="wide"><span>Seerr URL</span><input name="seerrUrl" type="url" placeholder="http://seerr:5055"></label>
+              <label class="wide"><span>API key</span><input name="seerrApiKey" type="password" placeholder="Leave blank to keep current key" autocomplete="new-password"></label>
+              <label><span>Poll interval</span><input name="pollInterval" placeholder="2m"></label>
+              <label><span>Scrape timeout</span><input name="resolveTimeout" placeholder="15m"></label>
+            </div>
+          </article>
+          <article class="panel settings-section">
+            <div class="panel-head"><div><p class="kicker">Resolution</p><h3>Providers & quality</h3></div></div>
+            <div class="field-grid">
+              <label class="wide"><span>Providers, in priority order</span><input name="providers" placeholder="torbox, alldebrid"></label>
+              <label><span>TorBox token</span><input name="torBoxToken" type="password" placeholder="Leave blank to keep current" autocomplete="new-password"></label>
+              <label><span>AllDebrid token</span><input name="allDebridToken" type="password" placeholder="Leave blank to keep current" autocomplete="new-password"></label>
+              <label class="wide"><span>Qualities</span><input name="qualities" placeholder="2160p, 1080p"></label>
+              <label><span>Minimum seeders</span><input name="minSeeders" type="number" min="0"></label>
+              <label><span>Results per quality</span><input name="maxResults" type="number" min="1" max="500"></label>
+              <label><span>Stream URL TTL</span><input name="streamUrlTtl" placeholder="45m"></label>
+              <label class="toggle-field"><span>Allow uncached releases</span><input name="allowUncached" type="checkbox"><i></i></label>
+            </div>
+          </article>
+          <article class="panel settings-section full">
+            <div class="panel-head"><div><p class="kicker">Sources</p><h3>Stremio addons</h3></div></div>
+            <label><span>One <code>name|manifest-url</code> per line</span><textarea name="stremioAddons" rows="5"></textarea></label>
+          </article>
+          <div class="settings-actions"><span id="settings-note">Secrets are never displayed after saving.</span><button type="submit" class="button primary">Save settings</button></div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="request-dialog">
+    <form method="dialog" class="dialog-card" id="request-form">
+      <button class="dialog-close" type="button" data-close-dialog aria-label="Close">×</button>
+      <p class="kicker">New request</p><h2 id="request-title">Request media</h2>
+      <p id="request-meta" class="muted"></p>
+      <label id="season-field"><span>Seasons</span><input id="request-seasons" placeholder="1, 2, 3" inputmode="numeric"><small>Enter season numbers separated by commas.</small></label>
+      <div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog>Cancel</button><button id="confirm-request" class="button primary" type="submit">Send request</button></div>
+    </form>
+  </dialog>
+  <script src="/app.js" defer></script>
+</body>
+</html>

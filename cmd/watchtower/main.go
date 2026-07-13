@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/config"
+	"github.com/LTAGROUP/watchtower/internal/dashboard"
 	"github.com/LTAGROUP/watchtower/internal/debrid"
 	"github.com/LTAGROUP/watchtower/internal/logging"
 	"github.com/LTAGROUP/watchtower/internal/scraper"
@@ -23,8 +24,16 @@ import (
 func main() {
 	log := slog.New(logging.NewConsoleHandler(os.Stdout, colorLogs()))
 	cfg := config.Load()
-	for _, e := range cfg.Validate() {
+	settings, err := config.OpenManager(cfg)
+	if err != nil {
+		log.Error("open settings", "error", err)
+		os.Exit(1)
+	}
+	for _, e := range settings.Snapshot().Validate() {
 		log.Warn("configuration", "error", e)
+	}
+	if cfg.DashboardPassword == "watchtower" {
+		log.Warn("dashboard is using the default password", "environment", "DASHBOARD_PASSWORD")
 	}
 	st, err := store.Open(cfg.DataFile)
 	if err != nil {
@@ -32,22 +41,26 @@ func main() {
 		os.Exit(1)
 	}
 	apiClient := &http.Client{Timeout: 30 * time.Second}
-	providers := map[string]debrid.Provider{}
-	if cfg.TorBoxToken != "" {
-		providers["torbox"] = &debrid.TorBox{Token: cfg.TorBoxToken, Client: apiClient, AllowUncached: cfg.AllowUncached}
+	providerFactory := func(current config.Config) map[string]debrid.Provider {
+		providers := map[string]debrid.Provider{}
+		if current.TorBoxToken != "" {
+			providers["torbox"] = &debrid.TorBox{Token: current.TorBoxToken, Client: apiClient, AllowUncached: current.AllowUncached}
+		}
+		if current.AllDebridToken != "" {
+			providers["alldebrid"] = &debrid.AllDebrid{Token: current.AllDebridToken, Client: apiClient, AllowUncached: current.AllowUncached}
+		}
+		return providers
 	}
-	if cfg.AllDebridToken != "" {
-		providers["alldebrid"] = &debrid.AllDebrid{Token: cfg.AllDebridToken, Client: apiClient, AllowUncached: cfg.AllowUncached}
+	scraperFactory := func(current config.Config) (scraper.Searcher, error) {
+		addons, err := scraper.ParseAddons(current.StremioAddons)
+		if err != nil {
+			return nil, err
+		}
+		return &scraper.Aggregator{Addons: addons, Client: apiClient, Log: log}, nil
 	}
-	addons, err := scraper.ParseAddons(cfg.StremioAddons)
-	if err != nil {
-		log.Error("configure scrapers", "error", err)
-		os.Exit(1)
-	}
-	scrapers := &scraper.Aggregator{Addons: addons, Client: apiClient, Log: log}
-	resolver := &service.Resolver{Config: cfg, Store: st, Scraper: scrapers, Providers: providers, Log: log}
+	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, Log: log}
 	streamClient := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}, Timeout: 0}
-	streamer := &service.Streamer{Store: st, Providers: providers, Client: streamClient, TTL: cfg.StreamURLTTL, Log: log}
+	streamer := &service.Streamer{Store: st, Settings: settings.Snapshot, ProviderFactory: providerFactory, Client: streamClient, TTL: cfg.StreamURLTTL, Log: log}
 	mux := http.NewServeMux()
 	mux.Handle("/dav/", &dav.Handler{Store: st, Streamer: streamer, Prefix: "/dav"})
 	mux.Handle("/dav", &dav.Handler{Store: st, Streamer: streamer, Prefix: "/dav"})
@@ -68,10 +81,10 @@ func main() {
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: requestLog(log, mux), ReadHeaderTimeout: 10 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	seerr := &service.Seerr{Config: cfg, Store: st, Resolver: resolver, Client: apiClient, Log: log}
-	if cfg.SeerrURL != "" && cfg.SeerrAPIKey != "" {
-		go seerr.Run(ctx)
-	}
+	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Client: apiClient, Log: log}
+	go seerr.Run(ctx)
+	dashboardHandler := (&dashboard.Handler{Store: st, Settings: settings, Resolver: resolver, Seerr: seerr, Username: cfg.DashboardUsername, Password: cfg.DashboardPassword, Log: log}).Routes()
+	dashboardServer := &http.Server{Addr: cfg.DashboardAddr, Handler: requestLog(log, dashboardHandler), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Info("listening", "address", cfg.ListenAddr)
 		if e := server.ListenAndServe(); e != nil && e != http.ErrServerClosed {
@@ -79,9 +92,17 @@ func main() {
 			stop()
 		}
 	}()
+	go func() {
+		log.Info("dashboard listening", "address", cfg.DashboardAddr)
+		if e := dashboardServer.ListenAndServe(); e != nil && e != http.ErrServerClosed {
+			log.Error("dashboard server", "error", e)
+			stop()
+		}
+	}()
 	<-ctx.Done()
 	shutdown, _ := context.WithTimeout(context.Background(), 15*time.Second)
 	_ = server.Shutdown(shutdown)
+	_ = dashboardServer.Shutdown(shutdown)
 }
 
 func colorLogs() bool {

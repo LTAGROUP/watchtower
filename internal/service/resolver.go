@@ -24,17 +24,36 @@ var episodeRE = regexp.MustCompile(`(?i)S(\d{1,2})E(\d{1,3})`)
 var videoExt = map[string]bool{".mkv": true, ".mp4": true, ".avi": true, ".m4v": true, ".ts": true, ".mov": true}
 
 type Resolver struct {
-	Config    config.Config
-	Store     *store.Store
-	Scraper   scraper.Searcher
-	Providers map[string]debrid.Provider
-	Log       *slog.Logger
+	Config          config.Config
+	Settings        func() config.Config
+	Store           *store.Store
+	Scraper         scraper.Searcher
+	ScraperFactory  func(config.Config) (scraper.Searcher, error)
+	Providers       map[string]debrid.Provider
+	ProviderFactory func(config.Config) map[string]debrid.Provider
+	Log             *slog.Logger
 }
 
 func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
+	cfg := r.Config
+	if r.Settings != nil {
+		cfg = r.Settings()
+	}
+	searcher := r.Scraper
+	if r.ScraperFactory != nil {
+		var err error
+		searcher, err = r.ScraperFactory(cfg)
+		if err != nil {
+			return err
+		}
+	}
+	providers := r.Providers
+	if r.ProviderFactory != nil {
+		providers = r.ProviderFactory(cfg)
+	}
 	started := time.Now()
 	if r.Log != nil {
-		r.Log.Info("media resolution started", "component", "resolver", "title", m.Title, "type", m.Type, "imdb_id", m.ExternalID, "tmdb_id", m.TMDBID, "qualities", r.Config.Qualities)
+		r.Log.Info("media resolution started", "component", "resolver", "title", m.Title, "type", m.Type, "imdb_id", m.ExternalID, "tmdb_id", m.TMDBID, "qualities", cfg.Qualities)
 	}
 	m.Status = "resolving"
 	m.UpdatedAt = time.Now().UTC()
@@ -46,7 +65,7 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		season  int
 	}
 	var jobs []job
-	for _, q := range r.Config.Qualities {
+	for _, q := range cfg.Qualities {
 		if m.Type == "tv" && len(m.Seasons) > 0 {
 			for _, season := range m.Seasons {
 				jobs = append(jobs, job{quality: q, season: season})
@@ -61,7 +80,10 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		if m.Type == "tv" && work.season > 0 {
 			label = fmt.Sprintf("S%02d %s", work.season, q)
 		}
-		rels, err := r.Scraper.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season}, r.Config.MaxResults)
+		m.Status = "scraping"
+		m.UpdatedAt = time.Now().UTC()
+		_ = r.Store.UpsertMedia(m)
+		rels, err := searcher.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season}, cfg.MaxResults)
 		if err != nil {
 			if r.Log != nil {
 				r.Log.Error("media scrape failed", "component", "resolver", "title", m.Title, "target", label, "error", err)
@@ -69,17 +91,21 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 			errs = append(errs, label+": "+err.Error())
 			continue
 		}
+		m.ScrapedAt = time.Now().UTC()
+		m.Status = "resolving"
+		m.UpdatedAt = m.ScrapedAt
+		_ = r.Store.UpsertMedia(m)
 		if r.Log != nil {
 			r.Log.Info("media scrape completed", "component", "resolver", "title", m.Title, "target", label, "streams", len(rels))
 		}
 		sort.SliceStable(rels, func(i, j int) bool { return releaseScore(rels[i], q) > releaseScore(rels[j], q) })
 		found := false
 		for _, rel := range rels {
-			if (rel.Seeders >= 0 && rel.Seeders < r.Config.MinSeeders) || !matchesQuality(rel.Title, q) {
+			if (rel.Seeders >= 0 && rel.Seeders < cfg.MinSeeders) || !matchesQuality(rel.Title, q) {
 				continue
 			}
-			for _, name := range r.Config.Providers {
-				p := r.Providers[name]
+			for _, name := range cfg.Providers {
+				p := providers[name]
 				if p == nil {
 					continue
 				}
@@ -87,7 +113,7 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 				if r.Log != nil {
 					r.Log.Info("provider resolution started", "component", "resolver", "title", m.Title, "target", label, "provider", p.Name(), "source", rel.Source, "release", rel.Title, "seeders", rel.Seeders, "size_bytes", rel.Size)
 				}
-				attempt, cancel := context.WithTimeout(ctx, r.Config.ResolveTimeout)
+				attempt, cancel := context.WithTimeout(ctx, cfg.ResolveTimeout)
 				resolved, e := p.Resolve(attempt, rel)
 				cancel()
 				if e != nil {

@@ -13,6 +13,6 @@ RUN apk add --no-cache ca-certificates tzdata \
     && chown watchtower:watchtower /data
 USER watchtower
 COPY --from=build /watchtower /usr/local/bin/watchtower
-EXPOSE 8080
+EXPOSE 8080 3001
 VOLUME ["/data"]
 ENTRYPOINT ["watchtower"]
