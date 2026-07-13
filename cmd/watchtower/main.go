@@ -12,7 +12,7 @@ import (
 
 	"github.com/LTAGROUP/watchtower/internal/config"
 	"github.com/LTAGROUP/watchtower/internal/debrid"
-	"github.com/LTAGROUP/watchtower/internal/indexer"
+	"github.com/LTAGROUP/watchtower/internal/scraper"
 	"github.com/LTAGROUP/watchtower/internal/service"
 	"github.com/LTAGROUP/watchtower/internal/store"
 	dav "github.com/LTAGROUP/watchtower/internal/webdav"
@@ -37,8 +37,13 @@ func main() {
 	if cfg.AllDebridToken != "" {
 		providers["alldebrid"] = &debrid.AllDebrid{Token: cfg.AllDebridToken, Client: apiClient, AllowUncached: cfg.AllowUncached}
 	}
-	idx := &indexer.Prowlarr{BaseURL: cfg.ProwlarrURL, APIKey: cfg.ProwlarrAPIKey, Client: apiClient}
-	resolver := &service.Resolver{Config: cfg, Store: st, Indexer: idx, Providers: providers}
+	addons, err := scraper.ParseAddons(cfg.StremioAddons)
+	if err != nil {
+		log.Error("configure scrapers", "error", err)
+		os.Exit(1)
+	}
+	scrapers := &scraper.Aggregator{Addons: addons, Client: apiClient}
+	resolver := &service.Resolver{Config: cfg, Store: st, Scraper: scrapers, Providers: providers}
 	streamClient := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}, Timeout: 0}
 	streamer := &service.Streamer{Store: st, Providers: providers, Client: streamClient, TTL: cfg.StreamURLTTL}
 	mux := http.NewServeMux()

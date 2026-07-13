@@ -1,13 +1,13 @@
 # WatchTower
 
-WatchTower presents debrid-hosted media to Plex as a normal, read-only filesystem. It searches existing indexers through Prowlarr, selects cached releases according to a configurable policy, adds them to TorBox or AllDebrid, and publishes a WebDAV tree that an rclone sidecar mounts for Plex. Media bytes are proxied on demand; they are not downloaded to disk.
+WatchTower presents debrid-hosted media to Plex as a normal, read-only filesystem. It queries configured Stremio-compatible scraper sources directly, selects cached releases according to a configurable policy, adds them to TorBox or AllDebrid, and publishes a WebDAV tree that an rclone sidecar mounts for Plex. Media bytes are proxied on demand; they are not downloaded to disk.
 
 This project is intended for media you are authorized to access. It does not bypass DRM, operate indexers, or ship scraper definitions.
 
 ## Current MVP
 
 - TorBox and AllDebrid provider adapters
-- Prowlarr as the scraper/indexer aggregation layer
+- direct aggregation of Torrentio, Comet, StremThru, and other Stremio-compatible scraper endpoints
 - automatic polling of approved Seerr movie and TV requests
 - independent 2160p and 1080p release selection
 - season-pack expansion into Plex-compatible episode paths
@@ -20,7 +20,7 @@ This project is intended for media you are authorized to access. It does not byp
 ## Data flow
 
 ```text
-Seerr request -> WatchTower -> Prowlarr -> TorBox / AllDebrid
+Seerr request -> WatchTower -> configured scraper addons -> TorBox / AllDebrid
                        |                         |
 Plex <- host mount <- rclone <- WebDAV/Range proxy
 ```
@@ -39,7 +39,7 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
 ## Linux setup
 
 1. Install Docker Engine with Compose and ensure `/dev/fuse` exists.
-2. Copy `.env.example` to `.env`, add the Prowlarr and Seerr URLs/API keys, then add the TorBox and/or AllDebrid tokens.
+2. Copy `.env.example` to `.env`, add the Seerr URL/API key and TorBox and/or AllDebrid tokens, then configure `STREMIO_ADDONS`.
 3. Set `MEDIA_MOUNT` to an **absolute host path**. Docker mount propagation must be supported by that filesystem.
 4. Start the core stack:
 
@@ -47,7 +47,7 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
    docker compose up -d --build
    ```
 
-   To include fresh Prowlarr and Seerr containers:
+   To include a fresh Seerr container:
 
    ```sh
    docker compose --profile bundled up -d --build
@@ -55,7 +55,13 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
 
 5. Add `${MEDIA_MOUNT}/Movies` and `${MEDIA_MOUNT}/TV` as Plex library roots. If Plex itself runs in Docker, bind the same host path into its container with `rslave` or `rshared` propagation.
 
-6. Configure indexers in Prowlarr. WatchTower searches Prowlarr's standard `/api/v1/search` endpoint and accepts magnet or `.torrent` results.
+6. Configure scraper sources with `STREMIO_ADDONS`. Each entry uses `name|manifest-url` and entries are comma-separated. WatchTower removes the trailing `/manifest.json` and calls the standard Stremio `/stream/{type}/{id}.json` resource directly. The default uses Torrentio; configured Comet and StremThru manifest URLs can be added without code changes.
+
+   ```env
+   STREMIO_ADDONS=torrentio|https://torrentio.strem.fun/manifest.json,comet|http://comet:8000/manifest.json
+   ```
+
+   Use scraper-only addon configurations and do not embed debrid credentials in these URLs. WatchTower performs provider cache checks and creates stream links itself.
 
 7. Configure Seerr with working Radarr/Sonarr service entries so its UI can create and approve requests. Disable automatic searching on those entries (`preventSearch`) to avoid a second download workflow. WatchTower polls approved requests and updates Seerr media status when files are ready.
 
@@ -73,9 +79,10 @@ The core port is intentionally not published. Add `ports: ["8080:8080"]` under `
 | Variable | Default | Purpose |
 |---|---:|---|
 | `PROVIDERS` | `torbox,alldebrid` | Provider preference/failover order |
+| `STREMIO_ADDONS` | Torrentio manifest | Direct scraper addon endpoints |
 | `QUALITIES` | `2160p,1080p` | Independent editions to source |
 | `ALLOW_UNCACHED` | `false` | Permit a provider to fetch uncached torrents |
-| `MIN_SEEDERS` | `1` | Ignore unhealthy search results |
+| `MIN_SEEDERS` | `0` | Optional minimum seed count; cached results do not require active peers |
 | `MAX_RESULTS_PER_QUALITY` | `20` | Search attempts per edition |
 | `RESOLVE_TIMEOUT` | `15m` | Maximum provider wait per candidate |
 | `STREAM_URL_TTL` | `45m` | Proactive URL refresh interval |
@@ -102,4 +109,3 @@ docker compose config
 ```
 
 Useful endpoints inside the Compose network are `GET /healthz`, `GET /api/v1/library`, `PROPFIND /dav/`, and `POST /webhooks/seerr`. Polling is authoritative; the webhook endpoint is available as a lightweight authenticated wake-up target for a later event-driven implementation.
-

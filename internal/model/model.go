@@ -6,6 +6,7 @@ type Media struct {
 	ID, RequestID        int64     `json:"id"`
 	Type                 string    `json:"type"`
 	TMDBID               int64     `json:"tmdbId"`
+	ExternalID           string    `json:"externalId"`
 	Title                string    `json:"title"`
 	Year                 int       `json:"year"`
 	Seasons              []int     `json:"seasons,omitempty"`
@@ -26,10 +27,10 @@ type File struct {
 }
 
 type Release struct {
-	Title, DownloadURL, InfoHash, Indexer string
-	Size                                  int64
-	Seeders                               int
-	TorrentData                           []byte
+	Title, DownloadURL, InfoHash, Source string
+	Size                                 int64
+	Seeders                              int
+	TorrentData                          []byte
 }
 
 type RemoteFile struct {

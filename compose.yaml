@@ -3,7 +3,9 @@ services:
     build: .
     image: watchtower:local
     restart: unless-stopped
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - watchtower-data:/data
     networks: [media]
@@ -42,19 +44,6 @@ services:
           propagation: rshared
     networks: [media]
 
-  prowlarr:
-    image: lscr.io/linuxserver/prowlarr:latest
-    profiles: [bundled]
-    restart: unless-stopped
-    environment:
-      PUID: ${PUID:-1000}
-      PGID: ${PGID:-1000}
-      TZ: ${TZ:-Etc/UTC}
-    volumes:
-      - prowlarr-data:/config
-    ports: ["9696:9696"]
-    networks: [media]
-
   seerr:
     image: ghcr.io/seerr-team/seerr:latest
     profiles: [bundled]
@@ -71,5 +60,4 @@ networks:
 
 volumes:
   watchtower-data:
-  prowlarr-data:
   seerr-data:

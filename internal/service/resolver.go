@@ -14,8 +14,8 @@ import (
 
 	"github.com/LTAGROUP/watchtower/internal/config"
 	"github.com/LTAGROUP/watchtower/internal/debrid"
-	"github.com/LTAGROUP/watchtower/internal/indexer"
 	"github.com/LTAGROUP/watchtower/internal/model"
+	"github.com/LTAGROUP/watchtower/internal/scraper"
 	"github.com/LTAGROUP/watchtower/internal/store"
 )
 
@@ -25,7 +25,7 @@ var videoExt = map[string]bool{".mkv": true, ".mp4": true, ".avi": true, ".m4v":
 type Resolver struct {
 	Config    config.Config
 	Store     *store.Store
-	Indexer   *indexer.Prowlarr
+	Scraper   scraper.Searcher
 	Providers map[string]debrid.Provider
 }
 
@@ -52,12 +52,10 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 	for _, work := range jobs {
 		q := work.quality
 		label := q
-		query := fmt.Sprintf("%s %d %s", m.Title, m.Year, q)
 		if m.Type == "tv" && work.season > 0 {
-			query = fmt.Sprintf("%s S%02d %s", m.Title, work.season, q)
 			label = fmt.Sprintf("S%02d %s", work.season, q)
 		}
-		rels, err := r.Indexer.Search(ctx, query, r.Config.MaxResults)
+		rels, err := r.Scraper.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season}, r.Config.MaxResults)
 		if err != nil {
 			errs = append(errs, label+": "+err.Error())
 			continue
@@ -65,14 +63,8 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		sort.SliceStable(rels, func(i, j int) bool { return releaseScore(rels[i], q) > releaseScore(rels[j], q) })
 		found := false
 		for _, rel := range rels {
-			if rel.Seeders < r.Config.MinSeeders || !strings.Contains(strings.ToLower(rel.Title), strings.ToLower(q)) {
+			if (rel.Seeders >= 0 && rel.Seeders < r.Config.MinSeeders) || !matchesQuality(rel.Title, q) {
 				continue
-			}
-			if !strings.HasPrefix(rel.DownloadURL, "magnet:") {
-				rel, err = r.Indexer.FetchTorrent(ctx, rel)
-				if err != nil {
-					continue
-				}
 			}
 			for _, name := range r.Config.Providers {
 				p := r.Providers[name]
@@ -123,7 +115,7 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 }
 func releaseScore(x model.Release, q string) int64 {
 	s := int64(x.Seeders) * 1000
-	if strings.Contains(strings.ToLower(x.Title), strings.ToLower(q)) {
+	if matchesQuality(x.Title, q) {
 		s += 1_000_000
 	}
 	n := strings.ToLower(x.Title)
@@ -134,6 +126,17 @@ func releaseScore(x model.Release, q string) int64 {
 		s += 3000
 	}
 	return s + x.Size/(1<<30)
+}
+func matchesQuality(title, quality string) bool {
+	title = strings.ToLower(title)
+	switch strings.ToLower(quality) {
+	case "2160p", "4k", "uhd":
+		return strings.Contains(title, "2160p") || strings.Contains(title, "4k") || strings.Contains(title, "uhd")
+	case "1080p", "fhd":
+		return strings.Contains(title, "1080p") || strings.Contains(title, "fhd")
+	default:
+		return strings.Contains(title, strings.ToLower(quality))
+	}
 }
 func (r *Resolver) materialize(m *model.Media, q, provider string, rel model.Release, res model.Resolved) []*model.File {
 	var out []*model.File

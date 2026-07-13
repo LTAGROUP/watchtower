@@ -44,10 +44,14 @@ type seerrRequest struct {
 }
 type details struct {
 	ID           int64  `json:"id"`
+	IMDBID       string `json:"imdbId"`
 	Title        string `json:"title"`
 	Name         string `json:"name"`
 	ReleaseDate  string `json:"releaseDate"`
 	FirstAirDate string `json:"firstAirDate"`
+	ExternalIDs  struct {
+		IMDBID string `json:"imdbId"`
+	} `json:"externalIds"`
 }
 
 func (s *Seerr) Run(ctx context.Context) {
@@ -120,7 +124,11 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 			seasons = append(seasons, v.SeasonNumber)
 		}
 	}
-	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, Title: title, Year: year, Seasons: seasons, Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	externalID := d.IMDBID
+	if externalID == "" {
+		externalID = d.ExternalIDs.IMDBID
+	}
+	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Seasons: seasons, Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if e = s.Store.UpsertMedia(m); e == nil {
 		e = s.Resolver.Resolve(ctx, m)
 	}

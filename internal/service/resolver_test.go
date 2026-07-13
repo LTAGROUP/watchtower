@@ -19,3 +19,15 @@ func TestMaterializeMovieAndSeasonPack(t *testing.T) {
 		t.Fatalf("tv paths: %#v", got)
 	}
 }
+
+func TestQualityAliases(t *testing.T) {
+	if !matchesQuality("Example UHD 4K REMUX", "2160p") {
+		t.Fatal("4K should satisfy 2160p")
+	}
+	if !matchesQuality("Example FHD WEB-DL", "1080p") {
+		t.Fatal("FHD should satisfy 1080p")
+	}
+	if matchesQuality("Example 720p", "1080p") {
+		t.Fatal("720p should not satisfy 1080p")
+	}
+}
