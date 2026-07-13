@@ -40,7 +40,7 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
 
 1. Install Docker Engine with Compose and ensure `/dev/fuse` exists.
 2. Copy `.env.example` to `.env`, add the Seerr URL/API key and TorBox and/or AllDebrid tokens, then configure `STREMIO_ADDONS`.
-3. Set `MEDIA_MOUNT` to an **absolute host path**. Docker mount propagation must be supported by that filesystem.
+3. Set `MEDIA_MOUNT` to an **absolute host path**. Docker mount propagation must be supported by that filesystem. Compose creates the directory when it is absent.
 4. Start the core stack:
 
    ```sh
@@ -93,10 +93,23 @@ Tokens remain in `.env` and are never included in the persisted library metadata
 ## Operational notes
 
 - The mount container needs `SYS_ADMIN`, `/dev/fuse`, and an unconfined AppArmor profile solely for its FUSE mount. The WatchTower process itself runs unprivileged.
+- The rclone sidecar uses `--allow-non-empty` because `/media` is already a Docker bind-mount target before FUSE is layered over it. This does not permit writes; the remote and mount remain read-only.
 - Plex must be able to read the mounted directory, and the host bind mount must use shared propagation. A Docker named volume cannot reliably propagate a nested FUSE mount to an unrelated Plex container.
 - Keep partial-content caching disabled unless the cache has enough disk capacity for your concurrent streams. The default rclone configuration streams directly.
 - State is intentionally simple for this MVP. A database migration should precede multi-replica deployments.
 - Provider API shapes occasionally change. Adapter failures are isolated, and the configured provider order provides failover, but live credential tests are still required before production use.
+
+### Clearing a stale FUSE mount
+
+If the mount container was killed without unmounting cleanly, stop the stack and detach the old host mount before starting it again:
+
+```sh
+docker compose down
+sudo fusermount3 -uz /absolute/path/from/MEDIA_MOUNT
+docker compose up -d
+```
+
+On systems without `fusermount3`, use `sudo umount -l /absolute/path/from/MEDIA_MOUNT` for the cleanup step.
 
 ## Development
 

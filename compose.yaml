@@ -28,6 +28,7 @@ services:
       - --webdav-url=http://watchtower:8080/dav/
       - --webdav-vendor=other
       - --allow-other
+      - --allow-non-empty
       - --read-only
       - --vfs-cache-mode=off
       - --dir-cache-time=30s
@@ -42,6 +43,7 @@ services:
         target: /media
         bind:
           propagation: rshared
+          create_host_path: true
     networks: [media]
 
   seerr:
