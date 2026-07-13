@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/config"
 	"github.com/LTAGROUP/watchtower/internal/debrid"
+	"github.com/LTAGROUP/watchtower/internal/logging"
 	"github.com/LTAGROUP/watchtower/internal/scraper"
 	"github.com/LTAGROUP/watchtower/internal/service"
 	"github.com/LTAGROUP/watchtower/internal/store"
@@ -19,7 +21,7 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := slog.New(logging.NewConsoleHandler(os.Stdout, colorLogs()))
 	cfg := config.Load()
 	for _, e := range cfg.Validate() {
 		log.Warn("configuration", "error", e)
@@ -81,6 +83,16 @@ func main() {
 	shutdown, _ := context.WithTimeout(context.Background(), 15*time.Second)
 	_ = server.Shutdown(shutdown)
 }
+
+func colorLogs() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LOG_COLOR"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 func requestLog(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

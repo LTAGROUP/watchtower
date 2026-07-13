@@ -87,6 +87,7 @@ The core port is intentionally not published. Add `ports: ["8080:8080"]` under `
 | `MAX_RESULTS_PER_QUALITY` | `20` | Search attempts per edition |
 | `RESOLVE_TIMEOUT` | `15m` | Maximum provider wait per candidate |
 | `STREAM_URL_TTL` | `45m` | Proactive URL refresh interval |
+| `LOG_COLOR` | `true` | Use colors and text styling in console logs; set to `false` for plain-text log collectors |
 | `SEERR_POLL_INTERVAL` | `2m` | Approved-request polling interval |
 | `VFS_CACHE_MAX_SIZE` | `20G` | Maximum transient rclone read cache size |
 | `VFS_CACHE_MAX_AGE` | `24h` | Evict cached chunks after their last access |
