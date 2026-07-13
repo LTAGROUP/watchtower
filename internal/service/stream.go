@@ -25,6 +25,7 @@ type Streamer struct {
 	Repair          func(context.Context, *model.File) (*model.File, error)
 	Client          *http.Client
 	TTL             time.Duration
+	RetryBackoff    time.Duration
 	Log             *slog.Logger
 	mu              sync.Mutex
 }
@@ -38,8 +39,20 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		u, e := s.url(r.Context(), f, attempt > 0)
 		if e != nil {
+			willRetry := errors.Is(e, debrid.ErrTransient) && attempt+1 < maxAttempts
 			if s.Log != nil {
-				s.Log.Error("stream link unavailable", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "error", e)
+				attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt + 1, "will_retry", willRetry, "error", e}
+				if willRetry {
+					s.Log.Warn("stream link temporarily unavailable", attrs...)
+				} else {
+					s.Log.Error("stream link unavailable", attrs...)
+				}
+			}
+			if willRetry {
+				if !s.waitForRetry(r.Context(), attempt) {
+					return
+				}
+				continue
 			}
 			http.Error(w, e.Error(), http.StatusBadGateway)
 			return
@@ -88,7 +101,11 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.Status, "bytes", written, "attempts", attempt + 1, "duration", time.Since(started).String()}
 			if e != nil {
 				attrs = append(attrs, "error", e)
-				s.Log.Warn("stream transfer interrupted", attrs...)
+				if clientClosedConnection(r.Context(), e) {
+					s.Log.Debug("stream transfer canceled by client", attrs...)
+				} else {
+					s.Log.Warn("stream transfer interrupted", attrs...)
+				}
 			} else {
 				s.Log.Info("stream request completed", attrs...)
 			}
@@ -97,16 +114,43 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 	}
 	http.Error(w, "unable to refresh stream URL", http.StatusBadGateway)
 }
+
+func clientClosedConnection(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "write tcp") && (strings.Contains(message, "connection reset by peer") || strings.Contains(message, "broken pipe"))
+}
+
+func (s *Streamer) waitForRetry(ctx context.Context, attempt int) bool {
+	d := s.RetryBackoff
+	if d <= 0 {
+		d = 500 * time.Millisecond
+	}
+	timer := time.NewTimer(d * time.Duration(1<<attempt))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func retryableStatus(status int) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests ||
 		status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status >= 500
 }
 func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, error) {
 	s.mu.Lock()
-	current, ok := s.Store.File(f.ID)
-	if !ok {
-		s.mu.Unlock()
-		return "", fmt.Errorf("file disappeared")
+	current, attached := s.Store.File(f.ID)
+	if !attached {
+		copy := *f
+		current = &copy
+		if s.Log != nil {
+			s.Log.Warn("stream file replaced during active request; continuing with original source", "component", "stream", "file", f.Path, "provider", f.Provider)
+		}
 	}
 	if !force && current.StreamURL != "" && time.Now().Before(current.StreamExpiresAt) {
 		u := current.StreamURL
@@ -119,8 +163,10 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 	}
 	s.mu.Unlock()
 	reason := "missing"
-	if force {
+	if force && current.StreamURL != "" {
 		reason = "upstream rejected previous link"
+	} else if force {
+		reason = "retry after provider error"
 	} else if current.StreamURL != "" {
 		reason = "expired"
 	}
@@ -141,7 +187,7 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		return "", fmt.Errorf("provider %q unavailable", current.Provider)
 	}
 	u, e := p.StreamURL(ctx, current)
-	if errors.Is(e, debrid.ErrStaleItem) && s.Repair != nil {
+	if errors.Is(e, debrid.ErrStaleItem) && s.Repair != nil && attached {
 		if s.Log != nil {
 			s.Log.Warn("stream source is stale; attempting automatic repair", "component", "stream", "file", current.Path, "provider", current.Provider, "error", e)
 		}

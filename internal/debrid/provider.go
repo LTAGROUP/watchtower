@@ -7,7 +7,10 @@ import (
 	"github.com/LTAGROUP/watchtower/internal/model"
 )
 
-var ErrStaleItem = errors.New("debrid item is no longer available")
+var (
+	ErrStaleItem = errors.New("debrid item is no longer available")
+	ErrTransient = errors.New("temporary debrid failure")
+)
 
 type Provider interface {
 	Name() string

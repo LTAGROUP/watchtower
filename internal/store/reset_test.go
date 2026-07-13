@@ -9,7 +9,7 @@ import (
 	"github.com/LTAGROUP/watchtower/internal/model"
 )
 
-func TestResetMediaRemovesFilesAndProcessedMarker(t *testing.T) {
+func TestResetMediaKeepsFilesAvailableAndRemovesProcessedMarker(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -31,8 +31,33 @@ func TestResetMediaRemovesFilesAndProcessedMarker(t *testing.T) {
 	if reset.Status != "queued" || reset.Error != "" || !reset.ScrapedAt.IsZero() {
 		t.Fatalf("unexpected reset media: %#v", reset)
 	}
-	if len(s.Files()) != 0 || s.IsProcessed(11) {
-		t.Fatal("reset did not clear files and processed marker")
+	if len(s.Files()) != 1 || s.IsProcessed(11) {
+		t.Fatal("reset removed active files or retained processed marker")
+	}
+}
+
+func TestReplaceFilesForMediaSwapsOnlyTargetMedia(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := &model.File{ID: "old", MediaID: 7, Path: "Movies/Old.mkv"}
+	other := &model.File{ID: "other", MediaID: 8, Path: "Movies/Other.mkv"}
+	if err := s.AddFiles(old, other); err != nil {
+		t.Fatal(err)
+	}
+	replacement := &model.File{ID: "new", MediaID: 7, Path: "Movies/New.mkv"}
+	if err := s.ReplaceFilesForMedia(7, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.File("old"); ok {
+		t.Fatal("old media file remained after replacement")
+	}
+	if _, ok := s.File("new"); !ok {
+		t.Fatal("replacement media file was not stored")
+	}
+	if _, ok := s.File("other"); !ok {
+		t.Fatal("unrelated media file was removed")
 	}
 }
 

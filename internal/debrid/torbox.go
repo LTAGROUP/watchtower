@@ -139,7 +139,10 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	resp, e := t.Client.Do(req)
 	if e != nil {
-		return "", e
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("%w: torbox request download: %v", ErrTransient, e)
 	}
 	defer resp.Body.Close()
 	body, e := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -148,6 +151,9 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 		return "", fmt.Errorf("%w: torbox download item returned %s", ErrStaleItem, resp.Status)
+	}
+	if transientHTTPStatus(resp.StatusCode) {
+		return "", fmt.Errorf("%w: torbox request download returned %s: %s", ErrTransient, resp.Status, strings.TrimSpace(string(body)))
 	}
 	if resp.StatusCode/100 != 2 {
 		return "", fmt.Errorf("torbox request download: %s: %s", resp.Status, strings.TrimSpace(string(body)))
@@ -173,7 +179,14 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 	if staleTorboxMessage(detail) {
 		return "", fmt.Errorf("%w: %s", ErrStaleItem, detail)
 	}
+	if transientTorboxMessage(detail) {
+		return "", fmt.Errorf("%w: %s", ErrTransient, detail)
+	}
 	return "", fmt.Errorf("torbox returned no stream URL: %s", detail)
+}
+
+func transientHTTPStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= 500
 }
 
 func torboxMessage(raw map[string]any) string {
@@ -188,6 +201,16 @@ func torboxMessage(raw map[string]any) string {
 func staleTorboxMessage(message string) bool {
 	message = strings.ToLower(message)
 	for _, fragment := range []string{"not found", "does not exist", "no longer", "invalid torrent", "invalid file"} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func transientTorboxMessage(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{"bad gateway", "gateway timeout", "service unavailable", "internal server error", "temporarily unavailable", "try again", "timed out", "timeout", "rate limit"} {
 		if strings.Contains(message, fragment) {
 			return true
 		}

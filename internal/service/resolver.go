@@ -69,6 +69,8 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 	_ = r.Store.UpsertMedia(m)
 	var errs []string
 	total := 0
+	var resolvedFiles []*model.File
+	resolvedSlots := map[string]bool{}
 	type job struct {
 		quality string
 		season  int
@@ -142,9 +144,8 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 					}
 					continue
 				}
-				if e = r.Store.AddFiles(files...); e != nil {
-					return e
-				}
+				resolvedFiles = append(resolvedFiles, files...)
+				resolvedSlots[resolutionSlot(m.Type, q, work.season)] = true
 				total += len(files)
 				if r.Log != nil {
 					r.Log.Info("provider resolution completed", "component", "resolver", "title", m.Title, "target", label, "provider", p.Name(), "source", rel.Source, "files_added", len(files), "cached", resolved.Cached, "duration", time.Since(attemptStarted).String())
@@ -170,6 +171,17 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		m.Status = "ready"
 		m.Error = ""
 	}
+	if total > 0 {
+		finalFiles := append([]*model.File(nil), resolvedFiles...)
+		for _, previous := range r.Store.FilesForMedia(m.ID) {
+			if !resolvedSlots[fileResolutionSlot(m.Type, previous)] {
+				finalFiles = append(finalFiles, previous)
+			}
+		}
+		if err := r.Store.ReplaceFilesForMedia(m.ID, finalFiles...); err != nil {
+			return err
+		}
+	}
 	m.UpdatedAt = time.Now().UTC()
 	err := r.Store.UpsertMedia(m)
 	if r.Log != nil {
@@ -185,6 +197,24 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		}
 	}
 	return err
+}
+
+func resolutionSlot(kind, quality string, season int) string {
+	quality = strings.ToLower(strings.TrimSpace(quality))
+	if kind == "tv" {
+		return fmt.Sprintf("%s|%d", quality, season)
+	}
+	return quality
+}
+
+func fileResolutionSlot(kind string, file *model.File) string {
+	season := 0
+	if kind == "tv" {
+		if match := episodeRE.FindStringSubmatch(file.Path); len(match) == 3 {
+			season, _ = strconv.Atoi(match[1])
+		}
+	}
+	return resolutionSlot(kind, file.Quality, season)
 }
 
 func (r *Resolver) Repair(ctx context.Context, stale *model.File) (*model.File, error) {

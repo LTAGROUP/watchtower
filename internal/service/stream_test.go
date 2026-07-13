@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,28 @@ type healingProvider struct {
 	calls int
 }
 
+type transientLinkProvider struct {
+	url      string
+	calls    int
+	failures int
+}
+
+type disconnectWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *disconnectWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *disconnectWriter) WriteHeader(status int) { w.status = status }
+func (w *disconnectWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("write tcp 172.25.0.2:8080->172.25.0.3:1234: connection reset by peer")
+}
+
 func (p *healingProvider) Name() string { return "test" }
 func (p *healingProvider) Resolve(context.Context, model.Release) (model.Resolved, error) {
 	return model.Resolved{}, nil
@@ -47,6 +70,18 @@ func (p *rotatingProvider) StreamURL(context.Context, *model.File) (string, erro
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
+	return p.url, nil
+}
+
+func (p *transientLinkProvider) Name() string { return "test" }
+func (p *transientLinkProvider) Resolve(context.Context, model.Release) (model.Resolved, error) {
+	return model.Resolved{}, nil
+}
+func (p *transientLinkProvider) StreamURL(context.Context, *model.File) (string, error) {
+	p.calls++
+	if p.calls <= p.failures {
+		return "", fmt.Errorf("%w: gateway unavailable", debrid.ErrTransient)
+	}
 	return p.url, nil
 }
 
@@ -119,6 +154,96 @@ func TestStreamerConvertsRepeatedProviderErrorsToBadGateway(t *testing.T) {
 	}
 	if provider.calls != 3 {
 		t.Fatalf("expected 3 URL refreshes, got %d", provider.calls)
+	}
+}
+
+func TestStreamerRetriesTransientLinkGenerationFailures(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer upstream.Close()
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &transientLinkProvider{url: upstream.URL, failures: 2}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour, RetryBackoff: time.Nanosecond}
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "video" {
+		t.Fatalf("unexpected response %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if provider.calls != 3 {
+		t.Fatalf("expected three link attempts, got %d", provider.calls)
+	}
+}
+
+func TestStreamerContinuesWhenFileIsReplacedDuringRetry(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "old", MediaID: 7, Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			replacement := &model.File{ID: "new", MediaID: 7, Path: file.Path, Provider: "test", Size: 5}
+			if replaceErr := st.ReplaceFilesForMedia(7, replacement); replaceErr != nil {
+				t.Errorf("replace file: %v", replaceErr)
+			}
+			http.Error(w, "temporary CDN failure", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer upstream.Close()
+	provider := &rotatingProvider{url: upstream.URL}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour}
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "video" {
+		t.Fatalf("unexpected response %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if provider.calls != 2 || requests != 2 {
+		t.Fatalf("expected retry through original source, provider calls=%d requests=%d", provider.calls, requests)
+	}
+}
+
+func TestStreamerTreatsDownstreamDisconnectAsExpectedCancellation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer upstream.Close()
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rotatingProvider{url: upstream.URL}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour, Log: logger}
+	writer := &disconnectWriter{}
+	streamer.Serve(writer, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if writer.status != http.StatusPartialContent {
+		t.Fatalf("unexpected status %d", writer.status)
+	}
+	if !strings.Contains(logs.String(), "stream transfer canceled by client") || strings.Contains(logs.String(), "stream transfer interrupted") {
+		t.Fatalf("unexpected disconnect logs: %s", logs.String())
 	}
 }
 

@@ -105,6 +105,25 @@ func (s *Store) AddFiles(files ...*model.File) error {
 	}
 	return s.saveLocked()
 }
+
+func (s *Store) ReplaceFilesForMedia(mediaID int64, files ...*model.File) error {
+	for _, f := range files {
+		if f == nil || f.MediaID != mediaID {
+			return fmt.Errorf("replacement file does not belong to media %d", mediaID)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for fileID, f := range s.state.Files {
+		if f.MediaID == mediaID {
+			delete(s.state.Files, fileID)
+		}
+	}
+	for _, f := range files {
+		s.state.Files[f.ID] = f
+	}
+	return s.saveLocked()
+}
 func (s *Store) MarkProcessed(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -198,11 +217,6 @@ func (s *Store) ResetMedia(id int64) (*model.Media, error) {
 	m := s.state.Media[id]
 	if m == nil {
 		return nil, os.ErrNotExist
-	}
-	for fileID, f := range s.state.Files {
-		if f.MediaID == id {
-			delete(s.state.Files, fileID)
-		}
 	}
 	delete(s.state.ProcessedRequests, m.RequestID)
 	m.Status = "queued"
