@@ -190,8 +190,8 @@ func (r *Resolver) materialize(m *model.Media, q, provider string, rel model.Rel
 			if len(out) > 0 {
 				break
 			}
-			base := safe(fmt.Sprintf("%s (%d)", m.Title, m.Year))
-			path = fmt.Sprintf("Movies/%s/%s - %s%s", base, base, q, ext)
+			base := plexFolderName(m)
+			path = fmt.Sprintf("Movies/%s/%s [%s]%s", base, base, safe(q), ext)
 		} else {
 			match := episodeRE.FindStringSubmatch(rf.Name)
 			if len(match) != 3 {
@@ -202,14 +202,34 @@ func (r *Resolver) materialize(m *model.Media, q, provider string, rel model.Rel
 			if len(m.Seasons) > 0 && !containsInt(m.Seasons, season) {
 				continue
 			}
-			show := safe(m.Title)
-			path = fmt.Sprintf("TV/%s/Season %02d/%s - S%02dE%02d - %s%s", show, season, show, season, ep, q, ext)
+			show := plexTitle(m)
+			path = fmt.Sprintf("TV/%s/Season %02d/%s - S%02dE%02d [%s]%s", plexFolderName(m), season, show, season, ep, safe(q), ext)
 		}
 		sum := sha256.Sum256([]byte(provider + "|" + res.ItemID + "|" + rf.ID + "|" + path))
 		out = append(out, &model.File{ID: hex.EncodeToString(sum[:12]), MediaID: m.ID, Path: path, Quality: q, Provider: provider, SourceURI: rel.DownloadURL, InfoHash: rel.InfoHash, ProviderItemID: res.ItemID, ProviderFileID: rf.ID, Size: rf.Size, CreatedAt: time.Now().UTC()})
 	}
 	return out
 }
+
+func plexTitle(m *model.Media) string {
+	title := safe(m.Title)
+	if m.Year > 0 {
+		return fmt.Sprintf("%s (%d)", title, m.Year)
+	}
+	return title
+}
+
+func plexFolderName(m *model.Media) string {
+	base := plexTitle(m)
+	if imdbID := strings.TrimSpace(m.ExternalID); strings.HasPrefix(strings.ToLower(imdbID), "tt") {
+		return fmt.Sprintf("%s {imdb-%s}", base, imdbID)
+	}
+	if m.TMDBID > 0 {
+		return fmt.Sprintf("%s {tmdb-%d}", base, m.TMDBID)
+	}
+	return base
+}
+
 func safe(s string) string {
 	r := strings.NewReplacer("/", "-", "\\", "-", ":", " -", "*", "", "?", "", `"`, "", "<", "", ">", "", "|", "-")
 	return strings.TrimSpace(r.Replace(s))
