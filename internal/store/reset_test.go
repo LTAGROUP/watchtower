@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -32,5 +33,32 @@ func TestResetMediaRemovesFilesAndProcessedMarker(t *testing.T) {
 	}
 	if len(s.Files()) != 0 || s.IsProcessed(11) {
 		t.Fatal("reset did not clear files and processed marker")
+	}
+}
+
+func TestOpenRepairsLegacyMediaIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{
+  "media": {"42": {"type":"movie","title":"Legacy"}},
+  "files": {"file": {"id":"file","mediaId":42,"Path":"Movies/Legacy.mkv"}},
+  "processedRequests": {}
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := s.Media()
+	if len(media) != 1 || media[0].ID != 42 || media[0].Status != "ready" {
+		t.Fatalf("legacy media was not repaired: %#v", media)
+	}
+	reset, err := s.ResetMedia(42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reset.ID != 42 || reset.Status != "queued" {
+		t.Fatalf("repaired media could not be reset: %#v", reset)
 	}
 }

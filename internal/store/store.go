@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +22,7 @@ type Store struct {
 
 func Open(path string) (*Store, error) {
 	s := &Store{path: path, state: model.State{Media: map[int64]*model.Media{}, Files: map[string]*model.File{}, ProcessedRequests: map[int64]time.Time{}}}
+	migrated := false
 	b, err := os.ReadFile(path)
 	if err == nil {
 		if err = json.Unmarshal(b, &s.state); err != nil {
@@ -37,6 +39,34 @@ func Open(path string) (*Store, error) {
 	}
 	if s.state.ProcessedRequests == nil {
 		s.state.ProcessedRequests = map[int64]time.Time{}
+	}
+	// Older state files were written while several Media fields shared the same
+	// JSON tag. The map key retained the canonical media ID even though the ID
+	// inside the value was omitted. Repair those records when they are loaded so
+	// dashboard actions can address them again.
+	for id, media := range s.state.Media {
+		if media == nil {
+			continue
+		}
+		if media.ID == 0 {
+			media.ID = id
+			migrated = true
+		}
+		if media.Status == "" {
+			media.Status = "queued"
+			for _, file := range s.state.Files {
+				if file.MediaID == id {
+					media.Status = "ready"
+					break
+				}
+			}
+			migrated = true
+		}
+	}
+	if migrated {
+		if err := s.saveLocked(); err != nil {
+			return nil, fmt.Errorf("migrate state: %w", err)
+		}
 	}
 	return s, nil
 }
