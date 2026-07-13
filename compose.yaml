@@ -30,7 +30,18 @@ services:
       - --allow-other
       - --allow-non-empty
       - --read-only
-      - --vfs-cache-mode=off
+      - --cache-dir=/cache
+      - --vfs-cache-mode=full
+      - --vfs-cache-max-size=${VFS_CACHE_MAX_SIZE:-20G}
+      - --vfs-cache-max-age=${VFS_CACHE_MAX_AGE:-24h}
+      - --vfs-cache-poll-interval=1m
+      - --vfs-read-chunk-size=${VFS_READ_CHUNK_SIZE:-4M}
+      - --vfs-read-chunk-size-limit=${VFS_READ_CHUNK_SIZE_LIMIT:-128M}
+      - --vfs-read-ahead=${VFS_READ_AHEAD:-4M}
+      - --buffer-size=${VFS_BUFFER_SIZE:-4M}
+      - --vfs-refresh
+      - --vfs-fast-fingerprint
+      - --no-modtime
       - --dir-cache-time=30s
       - --poll-interval=0
       - --log-level=INFO
@@ -38,6 +49,7 @@ services:
     devices: [/dev/fuse:/dev/fuse]
     security_opt: [apparmor:unconfined]
     volumes:
+      - watchtower-cache:/cache
       - type: bind
         source: ${MEDIA_MOUNT:-./mnt}
         target: /media
@@ -62,4 +74,5 @@ networks:
 
 volumes:
   watchtower-data:
+  watchtower-cache:
   seerr-data:

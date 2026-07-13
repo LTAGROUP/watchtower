@@ -13,7 +13,8 @@ This project is intended for media you are authorized to access. It does not byp
 - season-pack expansion into Plex-compatible episode paths
 - cached-only selection by default
 - HTTP Range and HEAD passthrough for seeking and Plex analysis
-- automatic regeneration of expired URLs after a 401, 403, or 404
+- bounded sparse-file caching for fast Plex analysis, random seeks, and repeated playback
+- automatic URL regeneration and retry after stale links, rate limits, timeouts, and provider 5xx responses
 - persistent JSON metadata with atomic updates; no media payload storage
 - a read-only WebDAV-to-FUSE mount using rclone
 
@@ -87,6 +88,10 @@ The core port is intentionally not published. Add `ports: ["8080:8080"]` under `
 | `RESOLVE_TIMEOUT` | `15m` | Maximum provider wait per candidate |
 | `STREAM_URL_TTL` | `45m` | Proactive URL refresh interval |
 | `SEERR_POLL_INTERVAL` | `2m` | Approved-request polling interval |
+| `VFS_CACHE_MAX_SIZE` | `20G` | Maximum transient rclone read cache size |
+| `VFS_CACHE_MAX_AGE` | `24h` | Evict cached chunks after their last access |
+| `VFS_READ_CHUNK_SIZE` | `4M` | Initial remote range-read size |
+| `VFS_READ_CHUNK_SIZE_LIMIT` | `128M` | Maximum sequential chunk size |
 
 Tokens remain in `.env` and are never included in the persisted library metadata or WebDAV paths. The TorBox playback token is sent only to TorBox; the generated URL remains in memory. AllDebrid links are unlocked on demand and likewise remain in memory.
 
@@ -95,7 +100,7 @@ Tokens remain in `.env` and are never included in the persisted library metadata
 - The mount container needs `SYS_ADMIN`, `/dev/fuse`, and an unconfined AppArmor profile solely for its FUSE mount. The WatchTower process itself runs unprivileged.
 - The rclone sidecar uses `--allow-non-empty` because `/media` is already a Docker bind-mount target before FUSE is layered over it. This does not permit writes; the remote and mount remain read-only.
 - Plex must be able to read the mounted directory, and the host bind mount must use shared propagation. A Docker named volume cannot reliably propagate a nested FUSE mount to an unrelated Plex container.
-- Keep partial-content caching disabled unless the cache has enough disk capacity for your concurrent streams. The default rclone configuration streams directly.
+- The rclone cache stores sparse, temporary chunks rather than complete permanent media copies. Plex probes and seeks are served from this cache when possible. Size and retention are bounded by `VFS_CACHE_MAX_SIZE` and `VFS_CACHE_MAX_AGE`.
 - State is intentionally simple for this MVP. A database migration should precede multi-replica deployments.
 - Provider API shapes occasionally change. Adapter failures are isolated, and the configured provider order provides failover, but live credential tests are still required before production use.
 
