@@ -23,7 +23,8 @@ type Streamer struct {
 }
 
 func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) {
-	for attempt := 0; attempt < 2; attempt++ {
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		u, e := s.url(r.Context(), f, attempt > 0)
 		if e != nil {
 			http.Error(w, e.Error(), http.StatusBadGateway)
@@ -35,15 +36,19 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		}
 		resp, e := s.Client.Do(req)
 		if e != nil {
-			if attempt == 0 {
+			if attempt+1 < maxAttempts {
 				continue
 			}
 			http.Error(w, e.Error(), http.StatusBadGateway)
 			return
 		}
-		if attempt == 0 && (resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404) {
+		if retryableStatus(resp.StatusCode) {
 			resp.Body.Close()
-			continue
+			if attempt+1 < maxAttempts {
+				continue
+			}
+			http.Error(w, fmt.Sprintf("provider stream unavailable after %d attempts (%s)", maxAttempts, resp.Status), http.StatusBadGateway)
+			return
 		}
 		defer resp.Body.Close()
 		for k, vs := range resp.Header {
@@ -61,6 +66,10 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		return
 	}
 	http.Error(w, "unable to refresh stream URL", http.StatusBadGateway)
+}
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests ||
+		status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status >= 500
 }
 func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, error) {
 	s.mu.Lock()
