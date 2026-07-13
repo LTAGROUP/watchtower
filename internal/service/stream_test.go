@@ -1,9 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -52,7 +55,8 @@ func TestStreamerRefreshesURLAfterProviderServerError(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &rotatingProvider{url: upstream.URL}
-	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour}
+	var logs bytes.Buffer
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour, Log: slog.New(slog.NewJSONHandler(&logs, nil))}
 	req := httptest.NewRequest(http.MethodGet, "http://watchtower/dav/Movies/Test/Test.mkv", nil)
 	req.Header.Set("Range", "bytes=0-4")
 	rec := httptest.NewRecorder()
@@ -65,6 +69,14 @@ func TestStreamerRefreshesURLAfterProviderServerError(t *testing.T) {
 	}
 	if requests != 2 {
 		t.Fatalf("expected two upstream attempts, got %d", requests)
+	}
+	for _, event := range []string{"stream link refresh started", "stream link obtained", "stream link rejected by upstream", "stream request completed"} {
+		if !strings.Contains(logs.String(), event) {
+			t.Errorf("expected %q log event; logs: %s", event, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), upstream.URL) {
+		t.Errorf("signed upstream URL leaked into logs: %s", logs.String())
 	}
 }
 

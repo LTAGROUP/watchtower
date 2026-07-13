@@ -68,6 +68,8 @@ func (s *Seerr) Run(ctx context.Context) {
 	}
 }
 func (s *Seerr) poll(ctx context.Context) {
+	started := time.Now()
+	s.Log.Info("seerr poll started", "component", "seerr")
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.Config.SeerrURL+"/api/v1/request?take=100&skip=0&sort=added", nil)
 	req.Header.Set("X-Api-Key", s.Config.SeerrAPIKey)
 	resp, e := s.Client.Do(req)
@@ -85,19 +87,24 @@ func (s *Seerr) poll(ctx context.Context) {
 		s.Log.Error("seerr decode", "error", e)
 		return
 	}
+	queued := 0
 	for _, x := range page.Results {
 		if x.Status != 2 || s.Store.IsProcessed(x.ID) {
 			continue
 		}
 		x := x
+		queued++
 		go s.handle(context.Background(), x)
 	}
+	s.Log.Info("seerr poll completed", "component", "seerr", "requests", len(page.Results), "new_approved_requests", queued, "duration", time.Since(started).String())
 }
 func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	if _, loaded := s.inflight.LoadOrStore(x.ID, struct{}{}); loaded {
 		return
 	}
 	defer s.inflight.Delete(x.ID)
+	started := time.Now()
+	s.Log.Info("seerr request processing started", "component", "seerr", "request", x.ID, "tmdb_id", x.Media.TMDBID)
 	kind := strings.ToLower(x.Type)
 	if kind == "" {
 		kind = strings.ToLower(x.Media.MediaType)
@@ -129,6 +136,7 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 		externalID = d.ExternalIDs.IMDBID
 	}
 	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Seasons: seasons, Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	s.Log.Info("seerr media details obtained", "component", "seerr", "request", x.ID, "title", title, "type", kind, "imdb_id", externalID, "tmdb_id", x.Media.TMDBID, "seasons", seasons)
 	if e = s.Store.UpsertMedia(m); e == nil {
 		e = s.Resolver.Resolve(ctx, m)
 	}
@@ -140,6 +148,7 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 		_ = s.Store.MarkProcessed(x.ID)
 		s.markAvailable(ctx, x.Media.ID)
 	}
+	s.Log.Info("seerr request processing completed", "component", "seerr", "request", x.ID, "title", title, "status", m.Status, "duration", time.Since(started).String())
 }
 func (s *Seerr) details(ctx context.Context, kind string, id int64) (details, error) {
 	u := fmt.Sprintf("%s/api/v1/%s/%d", s.Config.SeerrURL, kind, id)
@@ -162,8 +171,15 @@ func (s *Seerr) markAvailable(ctx context.Context, id int64) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(url.Values{}.Encode()))
 	req.Header.Set("X-Api-Key", s.Config.SeerrAPIKey)
 	resp, e := s.Client.Do(req)
-	if e == nil {
-		resp.Body.Close()
+	if e != nil {
+		s.Log.Warn("seerr availability update failed", "component", "seerr", "media", id, "error", e)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		s.Log.Info("seerr media marked available", "component", "seerr", "media", id)
+	} else {
+		s.Log.Warn("seerr availability update rejected", "component", "seerr", "media", id, "status", resp.Status)
 	}
 }
 func yearOf(s string) int {

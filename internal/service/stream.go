@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,14 +20,22 @@ type Streamer struct {
 	Providers map[string]debrid.Provider
 	Client    *http.Client
 	TTL       time.Duration
+	Log       *slog.Logger
 	mu        sync.Mutex
 }
 
 func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) {
 	const maxAttempts = 3
+	started := time.Now()
+	if s.Log != nil {
+		s.Log.Info("stream request started", "component", "stream", "file", f.Path, "provider", f.Provider, "method", r.Method, "range", r.Header.Get("Range"))
+	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		u, e := s.url(r.Context(), f, attempt > 0)
 		if e != nil {
+			if s.Log != nil {
+				s.Log.Error("stream link unavailable", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "error", e)
+			}
 			http.Error(w, e.Error(), http.StatusBadGateway)
 			return
 		}
@@ -36,6 +45,9 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		}
 		resp, e := s.Client.Do(req)
 		if e != nil {
+			if s.Log != nil {
+				s.Log.Warn("stream upstream request failed", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "will_refresh", attempt+1 < maxAttempts, "error", e)
+			}
 			if attempt+1 < maxAttempts {
 				continue
 			}
@@ -44,6 +56,9 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		}
 		if retryableStatus(resp.StatusCode) {
 			resp.Body.Close()
+			if s.Log != nil {
+				s.Log.Warn("stream link rejected by upstream", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "status", resp.Status, "will_refresh", attempt+1 < maxAttempts)
+			}
 			if attempt+1 < maxAttempts {
 				continue
 			}
@@ -60,8 +75,18 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
+		var written int64
 		if r.Method != http.MethodHead {
-			_, _ = io.Copy(w, resp.Body)
+			written, e = io.Copy(w, resp.Body)
+		}
+		if s.Log != nil {
+			attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.Status, "bytes", written, "attempts", attempt + 1, "duration", time.Since(started).String()}
+			if e != nil {
+				attrs = append(attrs, "error", e)
+				s.Log.Warn("stream transfer interrupted", attrs...)
+			} else {
+				s.Log.Info("stream request completed", attrs...)
+			}
 		}
 		return
 	}
@@ -79,7 +104,19 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		return "", fmt.Errorf("file disappeared")
 	}
 	if !force && current.StreamURL != "" && time.Now().Before(current.StreamExpiresAt) {
+		if s.Log != nil {
+			s.Log.Debug("using cached stream link", "component", "stream", "file", current.Path, "provider", current.Provider, "expires_in", time.Until(current.StreamExpiresAt).Round(time.Second).String())
+		}
 		return current.StreamURL, nil
+	}
+	reason := "missing"
+	if force {
+		reason = "upstream rejected previous link"
+	} else if current.StreamURL != "" {
+		reason = "expired"
+	}
+	if s.Log != nil {
+		s.Log.Info("stream link refresh started", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason)
 	}
 	p := s.Providers[current.Provider]
 	if p == nil {
@@ -87,9 +124,16 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 	}
 	u, e := p.StreamURL(ctx, current)
 	if e != nil {
+		if s.Log != nil {
+			s.Log.Warn("stream link refresh failed", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason, "error", e)
+		}
 		return "", e
 	}
-	s.Store.SetStream(current.ID, u, time.Now().Add(s.TTL))
+	expires := time.Now().Add(s.TTL)
+	s.Store.SetStream(current.ID, u, expires)
+	if s.Log != nil {
+		s.Log.Info("stream link obtained", "component", "stream", "file", current.Path, "provider", current.Provider, "valid_for", s.TTL.String())
+	}
 	return u, nil
 }
 func hopHeader(k string) bool {

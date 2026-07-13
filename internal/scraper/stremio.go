@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -31,6 +32,7 @@ type Addon struct{ Name, BaseURL string }
 type Aggregator struct {
 	Addons []Addon
 	Client *http.Client
+	Log    *slog.Logger
 }
 
 type streamResponse struct {
@@ -92,8 +94,9 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 		return nil, fmt.Errorf("no external media id")
 	}
 	type result struct {
-		rows []model.Release
-		err  error
+		addon string
+		rows  []model.Release
+		err   error
 	}
 	ch := make(chan result, len(a.Addons))
 	var wg sync.WaitGroup
@@ -103,7 +106,7 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 		go func() {
 			defer wg.Done()
 			rows, err := a.searchAddon(ctx, addon, mediaType, id)
-			ch <- result{rows, err}
+			ch <- result{addon: addon.Name, rows: rows, err: err}
 		}()
 	}
 	wg.Wait()
@@ -112,8 +115,14 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 	var errs []string
 	for result := range ch {
 		if result.err != nil {
+			if a.Log != nil {
+				a.Log.Warn("scraper search failed", "component", "scraper", "addon", result.addon, "media_type", mediaType, "media_id", id, "error", result.err)
+			}
 			errs = append(errs, result.err.Error())
 			continue
+		}
+		if a.Log != nil {
+			a.Log.Info("scraper search completed", "component", "scraper", "addon", result.addon, "media_type", mediaType, "media_id", id, "streams", len(result.rows))
 		}
 		for _, r := range result.rows {
 			h := strings.ToLower(r.InfoHash)
@@ -129,6 +138,9 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Seeders > out[j].Seeders })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
+	}
+	if a.Log != nil {
+		a.Log.Info("scraper aggregation completed", "component", "scraper", "media_type", mediaType, "media_id", id, "unique_streams", len(byHash), "returned_streams", len(out), "addons", len(a.Addons))
 	}
 	if len(out) == 0 && len(errs) > 0 {
 		return nil, fmt.Errorf("scrapers failed: %s", strings.Join(errs, "; "))
