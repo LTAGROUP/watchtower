@@ -142,8 +142,18 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 		return "", e
 	}
 	defer resp.Body.Close()
+	body, e := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if e != nil {
+		return "", e
+	}
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return "", fmt.Errorf("%w: torbox download item returned %s", ErrStaleItem, resp.Status)
+	}
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("torbox request download: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
 	var raw map[string]any
-	if e = json.NewDecoder(resp.Body).Decode(&raw); e != nil {
+	if e = json.Unmarshal(body, &raw); e != nil {
 		return "", e
 	}
 	d := raw["data"]
@@ -156,5 +166,31 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 			return s, nil
 		}
 	}
-	return "", fmt.Errorf("torbox returned no stream URL")
+	detail := torboxMessage(raw)
+	if detail == "" {
+		return "", fmt.Errorf("%w: download item returned no URL", ErrStaleItem)
+	}
+	if staleTorboxMessage(detail) {
+		return "", fmt.Errorf("%w: %s", ErrStaleItem, detail)
+	}
+	return "", fmt.Errorf("torbox returned no stream URL: %s", detail)
+}
+
+func torboxMessage(raw map[string]any) string {
+	for _, key := range []string{"detail", "error", "message"} {
+		if value := strings.TrimSpace(fmt.Sprint(raw[key])); value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	return ""
+}
+
+func staleTorboxMessage(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{"not found", "does not exist", "no longer", "invalid torrent", "invalid file"} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }

@@ -1,6 +1,7 @@
 const state = {
   route: 'dashboard', summary: null, media: [], files: [], queue: [], settings: null,
-  discover: { page: 1, totalPages: 1, results: [] }, libraryTab: 'media'
+  libraryTab: 'media', detailCache: new Map(),
+  discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true }
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -10,7 +11,7 @@ const escapeHTML = (value = '') => String(value).replace(/[&<>'"]/g, char => ({'
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
-    headers: { 'Accept': 'application/json', ...(options.body ? {'Content-Type':'application/json'} : {}), ...(options.headers || {}) }
+    headers: {'Accept':'application/json', ...(options.body ? {'Content-Type':'application/json'} : {}), ...(options.headers || {})}
   });
   let data = {};
   try { data = await response.json(); } catch (_) {}
@@ -35,16 +36,17 @@ function route() {
   const labels = {dashboard:['Operations','Overview'], discover:['Catalog','Discover'], library:['Collection','Library'], queue:['Pipeline','Queue'], settings:['Configuration','Settings']};
   $('#page-eyebrow').textContent = labels[state.route][0];
   $('#page-title').textContent = labels[state.route][1];
-  if (state.route === 'discover' && state.discover.results.length === 0) loadDiscover();
+  if (state.route === 'discover' && state.discover.results.length === 0) loadDiscover(true);
   if (state.route === 'settings' && !state.settings) loadSettings();
 }
 
 async function refreshAll(silent = false) {
   try {
-    const [summary, library, queue] = await Promise.all([
-      api('/api/v1/summary'), api('/api/v1/library'), api('/api/v1/queue')
-    ]);
-    state.summary = summary; state.media = library.media || []; state.files = library.files || []; state.queue = queue.items || [];
+    const [summary, library, queue] = await Promise.all([api('/api/v1/summary'), api('/api/v1/library'), api('/api/v1/queue')]);
+    state.summary = summary;
+    state.media = library.media || [];
+    state.files = library.files || [];
+    state.queue = queue.items || [];
     renderDashboard(); renderLibrary(); renderQueue();
     $('#queue-badge').textContent = state.queue.length;
     $('#system-status').textContent = 'System online';
@@ -74,7 +76,7 @@ function renderDashboard() {
   $('#pipeline-bars').innerHTML = statuses.map(key => `<div class="pipeline-row ${key}"><span>${key}</span><progress max="${total}" value="${s.statuses?.[key] || 0}"></progress><span>${s.statuses?.[key] || 0}</span></div>`).join('');
   const recent = [...state.media].sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt)).slice(0,5);
   $('#recent-list').classList.toggle('empty-state', recent.length === 0);
-  $('#recent-list').innerHTML = recent.length ? recent.map(item => `<div class="recent-item"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><strong>${escapeHTML(item.title)}${item.year ? ` <span class="muted">(${item.year})</span>` : ''}</strong><small>${timeAgo(item.updatedAt)} · ${filesFor(item.id).length} file${filesFor(item.id).length === 1 ? '' : 's'}</small></div><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span></div>`).join('') : 'No media has been indexed yet.';
+  $('#recent-list').innerHTML = recent.length ? recent.map(item => `<button class="recent-item recent-button" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><span><strong>${escapeHTML(item.title)}${item.year ? ` <span class="muted">(${item.year})</span>` : ''}</strong><small>${timeAgo(item.updatedAt)} · ${filesFor(item.id).length} file${filesFor(item.id).length === 1 ? '' : 's'}</small></span><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span></button>`).join('') : 'No media has been indexed yet.';
 }
 
 function renderLibrary() {
@@ -82,14 +84,22 @@ function renderLibrary() {
   $('#files-tab-count').textContent = state.files.length;
   const query = ($('#library-search')?.value || '').trim().toLowerCase();
   const isMedia = state.libraryTab === 'media';
-  $('#library-head').innerHTML = isMedia ? '<tr><th>Title</th><th>Type</th><th>Status</th><th>Files</th><th>Updated</th><th></th></tr>' : '<tr><th>File path</th><th>Quality</th><th>Provider</th><th>Size</th><th>Added</th></tr>';
+  $('#library-media-grid').hidden = !isMedia;
+  $('#library-files-table').hidden = isMedia;
   if (isMedia) {
-    const rows = [...state.media].sort((a,b) => String(a.title).localeCompare(String(b.title))).filter(item => `${item.title} ${item.year} ${item.status}`.toLowerCase().includes(query));
-    $('#library-body').innerHTML = rows.length ? rows.map(item => `<tr><td><strong>${escapeHTML(item.title)}</strong><span class="cell-sub">${item.tmdbId ? `TMDB ${item.tmdbId}` : item.externalId || 'No external ID'}</span></td><td>${item.type === 'tv' ? 'TV show' : 'Movie'}</td><td><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span></td><td>${filesFor(item.id).length}</td><td>${timeAgo(item.updatedAt)}</td><td><button class="row-action" data-reset-id="${item.id}">Reset & retry</button></td></tr>`).join('') : emptyRow(6, 'No media matches this filter.');
-  } else {
-    const rows = [...state.files].filter(file => `${file.path} ${file.quality} ${file.provider}`.toLowerCase().includes(query));
-    $('#library-body').innerHTML = rows.length ? rows.map(file => `<tr><td><strong>${escapeHTML(lastPath(file.path))}</strong><span class="cell-sub" title="${escapeHTML(file.path)}">${escapeHTML(file.path)}</span></td><td>${escapeHTML(file.quality)}</td><td>${escapeHTML(file.provider)}</td><td>${formatBytes(file.size)}</td><td>${timeAgo(file.createdAt)}</td></tr>`).join('') : emptyRow(5, 'No files match this filter.');
+    const items = [...state.media].sort((a,b) => String(a.title).localeCompare(String(b.title))).filter(item => `${item.title} ${item.year} ${item.status}`.toLowerCase().includes(query));
+    $('#library-media-grid').innerHTML = items.length ? items.map(libraryCard).join('') : '<div class="panel empty-state">No media matches this filter.</div>';
+    bindImageFallbacks($('#library-media-grid'));
+    return;
   }
+  $('#library-head').innerHTML = '<tr><th>File path</th><th>Quality</th><th>Provider</th><th>Size</th><th>Added</th></tr>';
+  const rows = [...state.files].filter(file => `${file.path} ${file.quality} ${file.provider}`.toLowerCase().includes(query));
+  $('#library-body').innerHTML = rows.length ? rows.map(file => `<tr><td><strong>${escapeHTML(lastPath(file.path))}</strong><span class="cell-sub" title="${escapeHTML(file.path)}">${escapeHTML(file.path)}</span></td><td>${escapeHTML(file.quality)}</td><td>${escapeHTML(file.provider)}</td><td>${formatBytes(file.size)}</td><td>${timeAgo(file.createdAt)}</td></tr>`).join('') : emptyRow(5, 'No files match this filter.');
+}
+
+function libraryCard(item) {
+  const poster = item.posterPath && /^\/[A-Za-z0-9._-]+$/.test(item.posterPath) ? `https://image.tmdb.org/t/p/w500${item.posterPath}` : `/api/v1/media/${item.id}/poster`;
+  return `<article class="poster-card" role="button" tabindex="0" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}"><div class="poster"><div class="poster-fallback">${escapeHTML(item.title)}</div><img src="${poster}" alt="" loading="lazy"><span class="poster-status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span><div class="poster-overlay"><button class="button ghost" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}">View details</button></div></div><div class="poster-copy"><strong title="${escapeHTML(item.title)}">${escapeHTML(item.title)}</strong><small><span>${item.year || '—'}</span><span>${item.type === 'tv' ? 'TV' : 'Movie'} · ${filesFor(item.id).length} files</span></small></div></article>`;
 }
 
 function renderQueue() {
@@ -100,31 +110,38 @@ function renderQueue() {
   $('#queue-list').innerHTML = list.length ? list.map(item => `<article class="queue-card"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><h3>${escapeHTML(item.title)} ${item.year ? `<span class="muted">(${item.year})</span>` : ''}</h3><p>${item.error ? escapeHTML(item.error) : `${item.seasons?.length ? `Seasons ${item.seasons.join(', ')} · ` : ''}updated ${timeAgo(item.updatedAt)}`}</p></div><div class="queue-actions"><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span><button class="button ghost" data-reset-id="${item.id}">Retry</button></div></article>`).join('') : '<div class="panel empty-state">The queue is clear. Everything tracked is ready.</div>';
 }
 
-async function loadDiscover() {
-  const form = $('#discover-form');
+async function loadDiscover(reset = false) {
+  if (state.discover.loading || (!reset && !state.discover.hasMore)) return;
+  if (reset) {
+    state.discover.page = 1; state.discover.totalPages = 1; state.discover.results = []; state.discover.hasMore = true;
+    $('#discover-grid').innerHTML = Array.from({length:12}, () => '<article class="poster-card"><div class="poster skeleton"></div><div class="poster-copy"><strong>&nbsp;</strong><small>&nbsp;</small></div></article>').join('');
+  }
+  state.discover.loading = true;
+  $('#discover-progress').textContent = 'Loading…';
   const query = $('#discover-query').value.trim();
   const type = $('#discover-type').value;
   let sort = $('#discover-sort').value;
   if (type === 'tv' && sort === 'primary_release_date.desc') sort = 'first_air_date.desc';
   const params = new URLSearchParams({page:state.discover.page, mediaType:type, genre:$('#discover-genre').value, year:$('#discover-year').value.trim(), sort});
   if (query) params.set('query', query);
-  $('#discover-grid').innerHTML = Array.from({length:12}, () => '<article class="poster-card"><div class="poster skeleton"></div><div class="poster-copy"><strong>&nbsp;</strong><small>&nbsp;</small></div></article>').join('');
-  form.querySelector('button').disabled = true;
   try {
     const data = await api(`/api/v1/discover?${params}`);
-    let results = data.results || [];
-    if (query) results = results.filter(item => !item.mediaType || item.mediaType === type);
-    state.discover.results = results;
+    let incoming = data.results || [];
+    if (query) incoming = incoming.filter(item => !item.mediaType || item.mediaType === type);
+    const seen = new Set(state.discover.results.map(item => `${item.mediaType || type}:${item.id}`));
+    incoming.forEach(item => { const key = `${item.mediaType || type}:${item.id}`; if (!seen.has(key)) { seen.add(key); state.discover.results.push(item); } });
     state.discover.totalPages = data.totalPages || data.total_pages || 1;
-    $('#discover-count').textContent = `${Number(data.totalResults || data.total_results || results.length).toLocaleString()} results`;
-    $('#page-count').textContent = `Page ${state.discover.page} of ${state.discover.totalPages}`;
-    $('#prev-page').disabled = state.discover.page <= 1;
-    $('#next-page').disabled = state.discover.page >= state.discover.totalPages;
+    state.discover.hasMore = state.discover.page < state.discover.totalPages && incoming.length > 0;
+    state.discover.page++;
+    $('#discover-count').textContent = `${Number(data.totalResults || data.total_results || state.discover.results.length).toLocaleString()} results`;
     renderDiscover(type);
   } catch (error) {
-    $('#discover-grid').innerHTML = `<div class="panel empty-state">${escapeHTML(error.message)}. Check the Seerr connection in Settings.</div>`;
+    if (state.discover.results.length === 0) $('#discover-grid').innerHTML = `<div class="panel empty-state">${escapeHTML(error.message)}. Check the Seerr connection in Settings.</div>`;
     showNotice(error.message, true);
-  } finally { form.querySelector('button').disabled = false; }
+  } finally {
+    state.discover.loading = false;
+    $('#discover-progress').textContent = state.discover.hasMore ? 'Scroll for more' : 'End of results';
+  }
 }
 
 function renderDiscover(defaultType) {
@@ -134,18 +151,138 @@ function renderDiscover(defaultType) {
     const date = item.releaseDate || item.firstAirDate || item.release_date || item.first_air_date || '';
     const year = date ? String(date).slice(0,4) : '';
     const poster = item.posterPath || item.poster_path;
-    const image = poster && /^\/[A-Za-z0-9._-]+$/.test(poster) ? `<img src="https://image.tmdb.org/t/p/w500${poster}" alt="" loading="lazy">` : `<div class="poster-fallback">${escapeHTML(title)}</div>`;
-    const requested = !!item.mediaInfo;
-    return `<article class="poster-card"><div class="poster">${image}<div class="poster-overlay"><button class="button ${requested ? 'ghost' : 'primary'}" ${requested ? 'disabled' : ''} data-request-id="${Number(item.id)}" data-request-type="${escapeHTML(type)}" data-request-title="${escapeHTML(title)}" data-request-year="${escapeHTML(year)}">${requested ? 'Already requested' : 'Request'}</button></div></div><div class="poster-copy"><strong title="${escapeHTML(title)}">${escapeHTML(title)}</strong><small><span>${escapeHTML(year || '—')}</span><span>${type === 'tv' ? 'TV' : 'Movie'}${item.voteAverage ? ` · ★ ${Number(item.voteAverage).toFixed(1)}` : ''}</span></small></div></article>`;
+    const image = poster && /^\/[A-Za-z0-9._-]+$/.test(poster) ? `<div class="poster-fallback">${escapeHTML(title)}</div><img src="https://image.tmdb.org/t/p/w500${poster}" alt="" loading="lazy">` : `<div class="poster-fallback">${escapeHTML(title)}</div>`;
+    const library = isInLibrary(type, item.id);
+    return `<article class="poster-card" role="button" tabindex="0" data-detail-type="${type}" data-detail-id="${Number(item.id)}"><div class="poster">${image}${library ? '<span class="poster-status ready">In library</span>' : ''}<div class="poster-overlay"><button class="button ${library ? 'ghost' : 'primary'}" ${library ? 'data-detail-type="'+type+'" data-detail-id="'+Number(item.id)+'"' : `data-request-id="${Number(item.id)}" data-request-type="${type}" data-request-title="${escapeHTML(title)}" data-request-year="${escapeHTML(year)}"`}>${library ? 'View details' : 'Request'}</button></div></div><div class="poster-copy"><strong title="${escapeHTML(title)}">${escapeHTML(title)}</strong><small><span>${escapeHTML(year || '—')}</span><span>${type === 'tv' ? 'TV' : 'Movie'}${item.voteAverage ? ` · ★ ${Number(item.voteAverage).toFixed(1)}` : ''}</span></small></div></article>`;
   }).join('') : '<div class="panel empty-state">No titles matched those filters.</div>';
+  bindImageFallbacks($('#discover-grid'));
+}
+
+async function loadDetails(type, id, fresh = false) {
+  const key = `${type}:${id}`;
+  if (!fresh && state.detailCache.has(key)) return state.detailCache.get(key);
+  const data = await api(`/api/v1/catalog/${type}/${id}`);
+  state.detailCache.set(key, data);
+  return data;
+}
+
+async function openMediaDetails(type, id) {
+  const dialog = $('#media-dialog');
+  dialog.dataset.type = type; dialog.dataset.id = id;
+  $('#detail-title').textContent = 'Loading…';
+  $('#detail-meta').textContent = '';
+  $('#detail-overview').textContent = '';
+  $('#detail-actions').innerHTML = '';
+  $('#detail-files').innerHTML = '<div class="empty-state">Loading media details…</div>';
+  $('#detail-seasons-section').hidden = true;
+  $('#detail-poster').innerHTML = '';
+  $('#detail-backdrop').removeAttribute('src');
+  if (!dialog.open) dialog.showModal();
+  try {
+    const data = await loadDetails(type, id, true);
+    renderMediaDetails(data, type, id);
+  } catch (error) {
+    $('#detail-title').textContent = 'Details unavailable';
+    $('#detail-overview').textContent = error.message;
+  }
+}
+
+function renderMediaDetails(data, type, id) {
+  const d = data.details || {};
+  const title = d.title || d.name || data.media?.title || 'Untitled';
+  const date = d.releaseDate || d.firstAirDate || '';
+  const year = String(date).slice(0,4) || data.media?.year || '';
+  const genres = (d.genres || []).map(g => g.name).filter(Boolean);
+  $('#detail-kicker').textContent = type === 'tv' ? 'TV series' : 'Movie';
+  $('#detail-title').textContent = title;
+  $('#detail-meta').textContent = [year, ...genres].filter(Boolean).join(' · ');
+  $('#detail-overview').textContent = d.overview || data.media?.overview || 'No description is available for this title.';
+  const poster = d.posterPath || data.media?.posterPath;
+  $('#detail-poster').innerHTML = poster ? `<img src="https://image.tmdb.org/t/p/w500${poster}" alt="">` : `<div class="poster-fallback">${escapeHTML(title)}</div>`;
+  const backdrop = d.backdropPath || data.media?.backdropPath;
+  if (backdrop) $('#detail-backdrop').src = `https://image.tmdb.org/t/p/w1280${backdrop}`; else $('#detail-backdrop').removeAttribute('src');
+  if (data.inLibrary) {
+    $('#detail-actions').innerHTML = `<button class="button ghost" data-reset-id="${data.media.id}">Reset & retry</button><button class="button danger" data-delete-id="${data.media.id}" data-delete-title="${escapeHTML(title)}">Delete from library</button>`;
+  } else {
+    $('#detail-actions').innerHTML = `<button class="button primary" data-request-id="${id}" data-request-type="${type}" data-request-title="${escapeHTML(title)}" data-request-year="${escapeHTML(year)}">Request media</button>`;
+  }
+  const seasons = (d.seasons || []).filter(season => season.seasonNumber > 0);
+  $('#detail-seasons-section').hidden = type !== 'tv';
+  $('#detail-season-count').textContent = `${seasons.length} season${seasons.length === 1 ? '' : 's'}`;
+  $('#detail-seasons').innerHTML = seasons.map(season => `<span class="detail-season">Season ${season.seasonNumber} · ${season.episodeCount || 0} episodes</span>`).join('') || '<span class="muted">Season information unavailable</span>';
+  const files = data.files || [];
+  $('#detail-file-count').textContent = `${files.length} file${files.length === 1 ? '' : 's'}`;
+  $('#detail-files').innerHTML = files.length ? files.map(file => `<article class="detail-file"><div><strong title="${escapeHTML(file.path)}">${escapeHTML(lastPath(file.path))}</strong><small>${escapeHTML(file.quality)} · ${escapeHTML(file.provider)} · ${formatBytes(file.size)}<br>${escapeHTML(file.path)}</small></div><span class="stream-pill">${escapeHTML(file.streamState || 'on demand')}</span></article>`).join('') : `<div class="empty-state">${data.inLibrary ? 'No files have been resolved yet.' : 'Request this title to create stream files.'}</div>`;
+}
+
+async function openRequest(button) {
+  const type = button.dataset.requestType;
+  const id = button.dataset.requestId;
+  const dialog = $('#request-dialog');
+  dialog.dataset.id = id; dialog.dataset.type = type;
+  $('#request-title').textContent = button.dataset.requestTitle;
+  $('#request-meta').textContent = `${type === 'tv' ? 'TV show' : 'Movie'}${button.dataset.requestYear ? ` · ${button.dataset.requestYear}` : ''}`;
+  $('#season-field').hidden = type !== 'tv';
+  $('#select-all-seasons').textContent = 'Select all';
+  $('#season-options').innerHTML = type === 'tv' ? '<div class="empty-state">Loading seasons…</div>' : '';
+  if (!dialog.open) dialog.showModal();
+  if (type !== 'tv') return;
+  try {
+    const data = await loadDetails(type, id);
+    const seasons = (data.details?.seasons || []).filter(season => season.seasonNumber > 0);
+    $('#season-options').innerHTML = seasons.length ? seasons.map(season => `<label class="season-option"><input type="checkbox" value="${season.seasonNumber}"><i></i><span><strong>${escapeHTML(season.name || `Season ${season.seasonNumber}`)}</strong><small>${season.episodeCount || 0} episodes</small></span></label>`).join('') : '<div class="empty-state">No requestable seasons were found.</div>';
+  } catch (error) {
+    $('#season-options').innerHTML = `<div class="empty-state">${escapeHTML(error.message)}</div>`;
+  }
+}
+
+async function submitRequest(event) {
+  event.preventDefault();
+  const dialog = $('#request-dialog');
+  const type = dialog.dataset.type;
+  const payload = {mediaId:Number(dialog.dataset.id), mediaType:type, is4k:false};
+  if (type === 'tv') payload.seasons = $$('input[type="checkbox"]:checked', $('#season-options')).map(input => Number(input.value));
+  const button = $('#confirm-request');
+  button.disabled = true;
+  try {
+    await api('/api/v1/requests', {method:'POST', body:JSON.stringify(payload)});
+    state.detailCache.delete(`${type}:${dialog.dataset.id}`);
+    dialog.close(); $('#media-dialog').close();
+    showNotice(`${$('#request-title').textContent} was queued directly in WatchTower.`);
+    await refreshAll(true); renderDiscover($('#discover-type').value);
+  } catch (error) { showNotice(error.message, true); }
+  finally { button.disabled = false; }
+}
+
+async function resetMedia(id, button) {
+  if (!id) return;
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/v1/media/${id}/reset`, {method:'POST'});
+    state.detailCache.clear();
+    showNotice('Media reset. A fresh scrape has started.');
+    setTimeout(() => refreshAll(true), 700);
+    $('#media-dialog').close();
+  } catch (error) { showNotice(error.message, true); if (button) button.disabled = false; }
+}
+
+async function deleteMedia(id, title, button) {
+  if (!confirm(`Delete ${title} and all of its WatchTower files? This does not delete media bytes because WatchTower only stores metadata.`)) return;
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/v1/media/${id}`, {method:'DELETE'});
+    state.detailCache.clear();
+    $('#media-dialog').close();
+    showNotice(`${title} was removed from WatchTower.`);
+    await refreshAll(true); renderDiscover($('#discover-type').value);
+  } catch (error) { showNotice(error.message, true); if (button) button.disabled = false; }
 }
 
 async function loadSettings() {
   try {
     const data = await api('/api/v1/settings');
     state.settings = data.settings;
-    const form = $('#settings-form');
-    const s = state.settings;
+    const form = $('#settings-form'); const s = state.settings;
     form.elements.seerrUrl.value = s.seerrUrl || '';
     form.elements.providers.value = (s.providers || []).join(', ');
     form.elements.qualities.value = (s.qualities || []).join(', ');
@@ -163,37 +300,18 @@ async function loadSettings() {
 
 async function saveSettings(event) {
   event.preventDefault();
-  const form = event.currentTarget;
-  const submit = form.querySelector('[type=submit]');
+  const form = event.currentTarget; const submit = form.querySelector('[type=submit]');
   const split = value => value.split(/[,\n]/).map(v => v.trim()).filter(Boolean);
-  const payload = {
-    seerrUrl: form.elements.seerrUrl.value.trim(), providers: split(form.elements.providers.value),
-    qualities: split(form.elements.qualities.value), stremioAddons: split(form.elements.stremioAddons.value),
-    pollInterval: form.elements.pollInterval.value.trim(), resolveTimeout: form.elements.resolveTimeout.value.trim(),
-    streamUrlTtl: form.elements.streamUrlTtl.value.trim(), minSeeders: Number(form.elements.minSeeders.value),
-    maxResults: Number(form.elements.maxResults.value), allowUncached: form.elements.allowUncached.checked
-  };
+  const payload = {seerrUrl:form.elements.seerrUrl.value.trim(), providers:split(form.elements.providers.value), qualities:split(form.elements.qualities.value), stremioAddons:split(form.elements.stremioAddons.value), pollInterval:form.elements.pollInterval.value.trim(), resolveTimeout:form.elements.resolveTimeout.value.trim(), streamUrlTtl:form.elements.streamUrlTtl.value.trim(), minSeeders:Number(form.elements.minSeeders.value), maxResults:Number(form.elements.maxResults.value), allowUncached:form.elements.allowUncached.checked};
   ['seerrApiKey','torBoxToken','allDebridToken'].forEach(name => { if (form.elements[name].value.trim()) payload[name] = form.elements[name].value.trim(); });
   submit.disabled = true;
   try {
     const result = await api('/api/v1/settings', {method:'PUT', body:JSON.stringify(payload)});
     state.settings = result.settings;
     ['seerrApiKey','torBoxToken','allDebridToken'].forEach(name => form.elements[name].value = '');
-    showNotice('Settings saved and applied.');
-    await loadSettings();
+    showNotice('Settings saved and applied.'); await loadSettings();
   } catch (error) { showNotice(error.message, true); }
   finally { submit.disabled = false; }
-}
-
-function openRequest(button) {
-  const dialog = $('#request-dialog');
-  dialog.dataset.id = button.dataset.requestId;
-  dialog.dataset.type = button.dataset.requestType;
-  $('#request-title').textContent = button.dataset.requestTitle;
-  $('#request-meta').textContent = `${button.dataset.requestType === 'tv' ? 'TV show' : 'Movie'}${button.dataset.requestYear ? ` · ${button.dataset.requestYear}` : ''}`;
-  $('#season-field').hidden = button.dataset.requestType !== 'tv';
-  $('#request-seasons').value = button.dataset.requestType === 'tv' ? '1' : '';
-  dialog.showModal();
 }
 
 function updateGenres() {
@@ -203,33 +321,10 @@ function updateGenres() {
   $('#discover-genre').innerHTML = values.map(([value,label]) => `<option value="${value}">${label}</option>`).join('');
 }
 
-async function submitRequest(event) {
-  event.preventDefault();
-  const dialog = $('#request-dialog');
-  const type = dialog.dataset.type;
-  const payload = {mediaId:Number(dialog.dataset.id), mediaType:type, is4k:false};
-  if (type === 'tv') payload.seasons = $('#request-seasons').value.split(',').map(v => Number(v.trim())).filter(v => Number.isInteger(v) && v > 0);
-  const button = $('#confirm-request');
-  button.disabled = true;
-  try {
-    await api('/api/v1/requests', {method:'POST', body:JSON.stringify(payload)});
-    dialog.close();
-    showNotice(`${$('#request-title').textContent} was sent to Seerr.`);
-    await loadDiscover();
-  } catch (error) { showNotice(error.message, true); }
-  finally { button.disabled = false; }
+function bindImageFallbacks(root) {
+  $$('img', root).forEach(img => img.addEventListener('error', () => img.remove(), {once:true}));
 }
-
-async function resetMedia(id, button) {
-  if (!id) return;
-  button && (button.disabled = true);
-  try {
-    await api(`/api/v1/media/${id}/reset`, {method:'POST'});
-    showNotice('Media reset. A fresh scrape has started.');
-    setTimeout(() => refreshAll(true), 700);
-  } catch (error) { showNotice(error.message, true); button && (button.disabled = false); }
-}
-
+function isInLibrary(type, tmdbID) { return state.media.some(item => item.type === type && Number(item.tmdbId) === Number(tmdbID)); }
 function filesFor(mediaId) { return state.files.filter(file => Number(file.mediaId) === Number(mediaId)); }
 function lastPath(path = '') { return String(path).split('/').pop(); }
 function emptyRow(columns, message) { return `<tr><td colspan="${columns}" class="empty-state">${escapeHTML(message)}</td></tr>`; }
@@ -238,22 +333,41 @@ function timeAgo(value) { const seconds = Math.max(0, (Date.now() - new Date(val
 
 window.addEventListener('hashchange', route);
 $('#refresh-button').addEventListener('click', () => refreshAll());
-$('#discover-form').addEventListener('submit', event => { event.preventDefault(); state.discover.page = 1; loadDiscover(); });
+$('#discover-form').addEventListener('submit', event => { event.preventDefault(); loadDiscover(true); });
 $('#discover-type').addEventListener('change', updateGenres);
-$('#prev-page').addEventListener('click', () => { if (state.discover.page > 1) { state.discover.page--; loadDiscover(); } });
-$('#next-page').addEventListener('click', () => { if (state.discover.page < state.discover.totalPages) { state.discover.page++; loadDiscover(); } });
 $('#library-search').addEventListener('input', renderLibrary);
 $$('[data-library-tab]').forEach(tab => tab.addEventListener('click', () => { state.libraryTab = tab.dataset.libraryTab; $$('[data-library-tab]').forEach(t => t.classList.toggle('active', t === tab)); renderLibrary(); }));
 $('#settings-form').addEventListener('submit', saveSettings);
 $('#request-form').addEventListener('submit', submitRequest);
+$('#select-all-seasons').addEventListener('click', event => {
+  const boxes = $$('input[type="checkbox"]', $('#season-options'));
+  const shouldCheck = boxes.some(box => !box.checked);
+  boxes.forEach(box => box.checked = shouldCheck);
+  event.currentTarget.textContent = shouldCheck ? 'Clear all' : 'Select all';
+});
 $('#retry-failed').addEventListener('click', async event => { const failed = state.queue.filter(item => item.status === 'failed'); event.currentTarget.disabled = true; await Promise.all(failed.map(item => resetMedia(item.id))); event.currentTarget.disabled = false; });
+document.addEventListener('keydown', event => {
+  if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('.poster-card')) {
+    event.preventDefault(); openMediaDetails(event.target.dataset.detailType, event.target.dataset.detailId);
+  }
+});
 document.addEventListener('click', event => {
   if (event.target.closest('[data-close-dialog]')) $('#request-dialog').close();
+  if (event.target.closest('[data-close-media]')) $('#media-dialog').close();
   const request = event.target.closest('[data-request-id]');
-  if (request) openRequest(request);
+  if (request) { event.stopPropagation(); openRequest(request); return; }
   const reset = event.target.closest('[data-reset-id]');
-  if (reset) resetMedia(reset.dataset.resetId, reset);
+  if (reset) { event.stopPropagation(); resetMedia(reset.dataset.resetId, reset); return; }
+  const remove = event.target.closest('[data-delete-id]');
+  if (remove) { event.stopPropagation(); deleteMedia(remove.dataset.deleteId, remove.dataset.deleteTitle, remove); return; }
+  const detail = event.target.closest('[data-detail-type][data-detail-id]');
+  if (detail) openMediaDetails(detail.dataset.detailType, detail.dataset.detailId);
 });
+
+const observer = new IntersectionObserver(entries => {
+  if (entries.some(entry => entry.isIntersecting) && state.route === 'discover') loadDiscover(false);
+}, {rootMargin:'500px 0px'});
+observer.observe($('#discover-sentinel'));
 
 route();
 refreshAll(true);

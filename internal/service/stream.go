@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,6 +22,7 @@ type Streamer struct {
 	Providers       map[string]debrid.Provider
 	ProviderFactory func(config.Config) map[string]debrid.Provider
 	Settings        func() config.Config
+	Repair          func(context.Context, *model.File) (*model.File, error)
 	Client          *http.Client
 	TTL             time.Duration
 	Log             *slog.Logger
@@ -101,17 +103,21 @@ func retryableStatus(status int) bool {
 }
 func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	current, ok := s.Store.File(f.ID)
 	if !ok {
+		s.mu.Unlock()
 		return "", fmt.Errorf("file disappeared")
 	}
 	if !force && current.StreamURL != "" && time.Now().Before(current.StreamExpiresAt) {
+		u := current.StreamURL
+		expiresAt := current.StreamExpiresAt
+		s.mu.Unlock()
 		if s.Log != nil {
-			s.Log.Debug("using cached stream link", "component", "stream", "file", current.Path, "provider", current.Provider, "expires_in", time.Until(current.StreamExpiresAt).Round(time.Second).String())
+			s.Log.Debug("using cached stream link", "component", "stream", "file", current.Path, "provider", current.Provider, "expires_in", time.Until(expiresAt).Round(time.Second).String())
 		}
-		return current.StreamURL, nil
+		return u, nil
 	}
+	s.mu.Unlock()
 	reason := "missing"
 	if force {
 		reason = "upstream rejected previous link"
@@ -135,6 +141,28 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		return "", fmt.Errorf("provider %q unavailable", current.Provider)
 	}
 	u, e := p.StreamURL(ctx, current)
+	if errors.Is(e, debrid.ErrStaleItem) && s.Repair != nil {
+		if s.Log != nil {
+			s.Log.Warn("stream source is stale; attempting automatic repair", "component", "stream", "file", current.Path, "provider", current.Provider, "error", e)
+		}
+		repaired, repairErr := s.Repair(ctx, current)
+		if repairErr != nil {
+			return "", fmt.Errorf("automatic stream repair failed: %w", repairErr)
+		}
+		current = repaired
+		if s.Settings != nil {
+			cfg := s.Settings()
+			ttl = cfg.StreamURLTTL
+			if s.ProviderFactory != nil {
+				providers = s.ProviderFactory(cfg)
+			}
+		}
+		p = providers[current.Provider]
+		if p == nil {
+			return "", fmt.Errorf("repaired provider %q unavailable", current.Provider)
+		}
+		u, e = p.StreamURL(ctx, current)
+	}
 	if e != nil {
 		if s.Log != nil {
 			s.Log.Warn("stream link refresh failed", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason, "error", e)

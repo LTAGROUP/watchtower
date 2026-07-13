@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/config"
@@ -32,6 +33,14 @@ type Resolver struct {
 	Providers       map[string]debrid.Provider
 	ProviderFactory func(config.Config) map[string]debrid.Provider
 	Log             *slog.Logger
+	repairMu        sync.Mutex
+	repairs         map[string]*repairCall
+}
+
+type repairCall struct {
+	done chan struct{}
+	file *model.File
+	err  error
 }
 
 func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
@@ -176,6 +185,130 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		}
 	}
 	return err
+}
+
+func (r *Resolver) Repair(ctx context.Context, stale *model.File) (*model.File, error) {
+	r.repairMu.Lock()
+	if r.repairs == nil {
+		r.repairs = map[string]*repairCall{}
+	}
+	if call := r.repairs[stale.ID]; call != nil {
+		r.repairMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-call.done:
+			return call.file, call.err
+		}
+	}
+	call := &repairCall{done: make(chan struct{})}
+	r.repairs[stale.ID] = call
+	r.repairMu.Unlock()
+
+	call.file, call.err = r.repair(ctx, stale)
+	close(call.done)
+	r.repairMu.Lock()
+	delete(r.repairs, stale.ID)
+	r.repairMu.Unlock()
+	return call.file, call.err
+}
+
+func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, error) {
+	media, ok := r.Store.MediaByID(stale.MediaID)
+	if !ok {
+		return nil, fmt.Errorf("repair media not found")
+	}
+	cfg := r.Config
+	if r.Settings != nil {
+		cfg = r.Settings()
+	}
+	searcher := r.Scraper
+	if r.ScraperFactory != nil {
+		var err error
+		searcher, err = r.ScraperFactory(cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
+	providers := r.Providers
+	if r.ProviderFactory != nil {
+		providers = r.ProviderFactory(cfg)
+	}
+	season := 0
+	if match := episodeRE.FindStringSubmatch(stale.Path); len(match) == 3 {
+		season, _ = strconv.Atoi(match[1])
+	}
+	if r.Log != nil {
+		r.Log.Warn("stale stream repair started", "component", "resolver", "title", media.Title, "file", stale.Path, "quality", stale.Quality, "provider", stale.Provider)
+	}
+	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: season}, cfg.MaxResults)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(releases, func(i, j int) bool {
+		return releaseScore(releases[i], stale.Quality) > releaseScore(releases[j], stale.Quality)
+	})
+	providerOrder := append([]string(nil), cfg.Providers...)
+	if stale.Provider != "" {
+		providerOrder = moveFirst(providerOrder, stale.Provider)
+	}
+	for _, release := range releases {
+		if (release.Seeders >= 0 && release.Seeders < cfg.MinSeeders) || !matchesQuality(release.Title, stale.Quality) {
+			continue
+		}
+		for _, name := range providerOrder {
+			provider := providers[name]
+			if provider == nil {
+				continue
+			}
+			attempt, cancel := context.WithTimeout(ctx, cfg.ResolveTimeout)
+			resolved, resolveErr := provider.Resolve(attempt, release)
+			cancel()
+			if resolveErr != nil {
+				continue
+			}
+			target := *media
+			if season > 0 {
+				target.Seasons = []int{season}
+			}
+			for _, replacement := range r.materialize(&target, stale.Quality, provider.Name(), release, resolved) {
+				if !sameMediaFile(media.Type, stale.Path, replacement.Path) {
+					continue
+				}
+				updated, replaceErr := r.Store.ReplaceFileSource(stale.ID, replacement)
+				if replaceErr != nil {
+					return nil, replaceErr
+				}
+				if r.Log != nil {
+					r.Log.Info("stale stream repair completed", "component", "resolver", "title", media.Title, "file", stale.Path, "provider", provider.Name())
+				}
+				return updated, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no replacement cached release found for %s", stale.Path)
+}
+
+func moveFirst(values []string, wanted string) []string {
+	out := []string{wanted}
+	for _, value := range values {
+		if value != wanted {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func sameMediaFile(kind, current, replacement string) bool {
+	if !strings.EqualFold(filepath.Ext(current), filepath.Ext(replacement)) {
+		return false
+	}
+	if kind == "movie" {
+		return true
+	}
+	a := episodeRE.FindStringSubmatch(current)
+	b := episodeRE.FindStringSubmatch(replacement)
+	return len(a) == 3 && len(b) == 3 && a[1] == b[1] && a[2] == b[2]
 }
 func releaseScore(x model.Release, q string) int64 {
 	s := int64(x.Seeders) * 1000

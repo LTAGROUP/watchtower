@@ -117,6 +117,29 @@ func (s *Store) File(id string) (*model.File, bool) {
 	f, ok := s.state.Files[id]
 	return f, ok
 }
+func (s *Store) MediaByID(id int64) (*model.Media, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.state.Media[id]
+	if !ok || m == nil {
+		return nil, false
+	}
+	copy := *m
+	copy.Seasons = append([]int(nil), m.Seasons...)
+	return &copy, true
+}
+func (s *Store) FindMediaByTMDB(kind string, tmdbID int64) (*model.Media, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, m := range s.state.Media {
+		if m != nil && m.Type == kind && m.TMDBID == tmdbID {
+			copy := *m
+			copy.Seasons = append([]int(nil), m.Seasons...)
+			return &copy, true
+		}
+	}
+	return nil, false
+}
 func (s *Store) SetStream(id, u string, exp time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,6 +154,19 @@ func (s *Store) Files() []*model.File {
 	out := make([]*model.File, 0, len(s.state.Files))
 	for _, f := range s.state.Files {
 		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+func (s *Store) FilesForMedia(mediaID int64) []*model.File {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*model.File, 0)
+	for _, f := range s.state.Files {
+		if f.MediaID == mediaID {
+			copy := *f
+			out = append(out, &copy)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
@@ -178,5 +214,44 @@ func (s *Store) ResetMedia(id int64) (*model.Media, error) {
 	}
 	copy := *m
 	copy.Seasons = append([]int(nil), m.Seasons...)
+	return &copy, nil
+}
+
+func (s *Store) DeleteMedia(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Media[id] == nil {
+		return os.ErrNotExist
+	}
+	delete(s.state.Media, id)
+	for fileID, f := range s.state.Files {
+		if f.MediaID == id {
+			delete(s.state.Files, fileID)
+		}
+	}
+	// Keep the processed Seerr request marker. Otherwise an approved request
+	// would be imported again on the next poll immediately after deletion.
+	return s.saveLocked()
+}
+
+func (s *Store) ReplaceFileSource(id string, replacement *model.File) (*model.File, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.state.Files[id]
+	if current == nil {
+		return nil, os.ErrNotExist
+	}
+	current.Provider = replacement.Provider
+	current.SourceURI = replacement.SourceURI
+	current.InfoHash = replacement.InfoHash
+	current.ProviderItemID = replacement.ProviderItemID
+	current.ProviderFileID = replacement.ProviderFileID
+	current.Size = replacement.Size
+	current.StreamURL = ""
+	current.StreamExpiresAt = time.Time{}
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	copy := *current
 	return &copy, nil
 }

@@ -79,8 +79,9 @@
           <label><span>Sort</span><select id="discover-sort"><option value="popularity.desc">Most popular</option><option value="vote_average.desc">Highest rated</option><option value="primary_release_date.desc">Newest first</option></select></label>
           <button class="button primary" type="submit">Explore</button>
         </form>
-        <div class="results-head"><p id="discover-count">Popular right now</p><div class="pagination"><button id="prev-page" class="icon-button" aria-label="Previous page">←</button><span id="page-count">Page 1</span><button id="next-page" class="icon-button" aria-label="Next page">→</button></div></div>
+        <div class="results-head"><p id="discover-count">Popular right now</p><span class="muted" id="discover-progress"></span></div>
         <div id="discover-grid" class="poster-grid"></div>
+        <div id="discover-sentinel" class="scroll-sentinel" aria-hidden="true"></div>
       </section>
 
       <section class="page" id="library-page">
@@ -92,7 +93,8 @@
           <button class="tab active" data-library-tab="media">Media <span id="media-tab-count">0</span></button>
           <button class="tab" data-library-tab="files">Files <span id="files-tab-count">0</span></button>
         </div>
-        <div class="table-card">
+        <div id="library-media-grid" class="poster-grid library-grid"></div>
+        <div id="library-files-table" class="table-card" hidden>
           <div class="table-scroll"><table><thead id="library-head"></thead><tbody id="library-body"></tbody></table></div>
         </div>
       </section>
@@ -143,9 +145,39 @@
       <button class="dialog-close" type="button" data-close-dialog aria-label="Close">×</button>
       <p class="kicker">New request</p><h2 id="request-title">Request media</h2>
       <p id="request-meta" class="muted"></p>
-      <label id="season-field"><span>Seasons</span><input id="request-seasons" placeholder="1, 2, 3" inputmode="numeric"><small>Enter season numbers separated by commas.</small></label>
+      <div id="season-field" class="season-field" hidden>
+        <div class="season-heading"><span>Choose seasons</span><button id="select-all-seasons" type="button">Select all</button></div>
+        <div id="season-options" class="season-options"></div>
+      </div>
       <div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog>Cancel</button><button id="confirm-request" class="button primary" type="submit">Send request</button></div>
     </form>
+  </dialog>
+
+  <dialog id="media-dialog" class="media-dialog">
+    <article class="media-detail">
+      <button class="dialog-close" type="button" data-close-media aria-label="Close">×</button>
+      <div class="detail-hero" id="detail-hero">
+        <img id="detail-backdrop" class="detail-backdrop" alt="">
+        <div class="detail-poster" id="detail-poster"></div>
+        <div class="detail-copy">
+          <p class="kicker" id="detail-kicker">Media details</p>
+          <h2 id="detail-title">Loading…</h2>
+          <p class="detail-meta" id="detail-meta"></p>
+          <p class="detail-overview" id="detail-overview"></p>
+          <div class="detail-actions" id="detail-actions"></div>
+        </div>
+      </div>
+      <div class="detail-body">
+        <section id="detail-seasons-section" hidden>
+          <div class="detail-section-head"><h3>Seasons</h3><span id="detail-season-count" class="muted"></span></div>
+          <div id="detail-seasons" class="detail-seasons"></div>
+        </section>
+        <section>
+          <div class="detail-section-head"><h3>Files & streams</h3><span id="detail-file-count" class="muted"></span></div>
+          <div id="detail-files" class="detail-files"></div>
+        </section>
+      </div>
+    </article>
   </dialog>
   <script src="/app.js" defer></script>
 </body>

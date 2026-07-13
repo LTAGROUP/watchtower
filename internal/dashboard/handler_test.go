@@ -1,17 +1,28 @@
 package dashboard
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/config"
 	"github.com/LTAGROUP/watchtower/internal/model"
+	"github.com/LTAGROUP/watchtower/internal/scraper"
+	"github.com/LTAGROUP/watchtower/internal/service"
 	"github.com/LTAGROUP/watchtower/internal/store"
 )
+
+type failingCatalogSearcher struct{}
+
+func (failingCatalogSearcher) Search(context.Context, scraper.Query, int) ([]model.Release, error) {
+	return nil, errors.New("stop after direct request persistence")
+}
 
 func TestDashboardRequiresBasicAuthAndReturnsSummary(t *testing.T) {
 	dir := t.TempDir()
@@ -89,5 +100,48 @@ func TestLibraryUsesFrontendJSONFieldNames(t *testing.T) {
 	}
 	if result.Media[0]["id"] != float64(8) || result.Media[0]["status"] != "partial" || result.Files[0]["path"] != "Movies/Example.mkv" {
 		t.Fatalf("unexpected library JSON: %#v", result)
+	}
+}
+
+func TestCreateRequestQueuesDirectlyWithoutPostingToSeerr(t *testing.T) {
+	var methods []string
+	catalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method+" "+r.URL.Path)
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/tv/99" {
+			http.Error(w, "unexpected", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":99,"name":"Direct Show","overview":"A direct request.","firstAirDate":"2025-01-02","posterPath":"/poster.jpg","externalIds":{"imdbId":"tt123"},"seasons":[{"seasonNumber":1,"name":"Season 1","episodeCount":8},{"seasonNumber":2,"name":"Season 2","episodeCount":6}]}`))
+	}))
+	defer catalog.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{SeerrURL: catalog.URL, SeerrAPIKey: "key", Qualities: []string{"1080p"}, Providers: []string{"torbox"}, MaxResults: 1, ResolveTimeout: time.Second}
+	resolver := &service.Resolver{Config: cfg, Store: st, Scraper: failingCatalogSearcher{}}
+	seerr := &service.Seerr{Config: cfg, Store: st, Resolver: resolver, Client: catalog.Client()}
+	handler := (&Handler{Store: st, Resolver: resolver, Seerr: seerr, Username: "admin", Password: "secret"}).Routes()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/requests", strings.NewReader(`{"mediaType":"tv","mediaId":99,"seasons":[1,2],"is4k":false}`))
+	req.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", response.Code, response.Body.String())
+	}
+	media, ok := st.FindMediaByTMDB("tv", 99)
+	if !ok || media.Title != "Direct Show" || len(media.Seasons) != 2 || media.RequestID != 0 {
+		t.Fatalf("direct request was not persisted correctly: %#v", media)
+	}
+	deadline := time.Now().Add(time.Second)
+	for media.Status != "failed" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		media, _ = st.FindMediaByTMDB("tv", 99)
+	}
+	if media.Status != "failed" {
+		t.Fatalf("background resolver did not finish: %#v", media)
+	}
+	if len(methods) != 1 || methods[0] != "GET /api/v1/tv/99" {
+		t.Fatalf("request unexpectedly posted to Seerr: %#v", methods)
 	}
 }

@@ -22,6 +22,23 @@ type rotatingProvider struct {
 	calls int
 }
 
+type healingProvider struct {
+	url   string
+	calls int
+}
+
+func (p *healingProvider) Name() string { return "test" }
+func (p *healingProvider) Resolve(context.Context, model.Release) (model.Resolved, error) {
+	return model.Resolved{}, nil
+}
+func (p *healingProvider) StreamURL(_ context.Context, file *model.File) (string, error) {
+	p.calls++
+	if file.ProviderItemID == "stale" {
+		return "", debrid.ErrStaleItem
+	}
+	return p.url, nil
+}
+
 func (p *rotatingProvider) Name() string { return "test" }
 func (p *rotatingProvider) Resolve(context.Context, model.Release) (model.Resolved, error) {
 	return model.Resolved{}, nil
@@ -102,5 +119,40 @@ func TestStreamerConvertsRepeatedProviderErrorsToBadGateway(t *testing.T) {
 	}
 	if provider.calls != 3 {
 		t.Fatalf("expected 3 URL refreshes, got %d", provider.calls)
+	}
+}
+
+func TestStreamerRepairsStaleProviderItemBeforeServing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer upstream.Close()
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", ProviderItemID: "stale", Size: 5}
+	if err := st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &healingProvider{url: upstream.URL}
+	repairs := 0
+	streamer := &Streamer{
+		Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour,
+		Repair: func(_ context.Context, stale *model.File) (*model.File, error) {
+			repairs++
+			updated := *stale
+			updated.ProviderItemID = "fresh"
+			return &updated, nil
+		},
+	}
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "video" {
+		t.Fatalf("unexpected response %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if repairs != 1 || provider.calls != 2 {
+		t.Fatalf("expected one repair and two link attempts, got repairs=%d calls=%d", repairs, provider.calls)
 	}
 }

@@ -44,14 +44,31 @@ type seerrRequest struct {
 		SeasonNumber int `json:"seasonNumber"`
 	} `json:"seasons"`
 }
-type details struct {
-	ID           int64  `json:"id"`
-	IMDBID       string `json:"imdbId"`
-	Title        string `json:"title"`
+type CatalogSeason struct {
+	SeasonNumber int    `json:"seasonNumber"`
 	Name         string `json:"name"`
-	ReleaseDate  string `json:"releaseDate"`
-	FirstAirDate string `json:"firstAirDate"`
-	ExternalIDs  struct {
+	EpisodeCount int    `json:"episodeCount"`
+	Overview     string `json:"overview"`
+	PosterPath   string `json:"posterPath"`
+}
+
+type CatalogDetails struct {
+	ID              int64           `json:"id"`
+	IMDBID          string          `json:"imdbId"`
+	Title           string          `json:"title"`
+	Name            string          `json:"name"`
+	Overview        string          `json:"overview"`
+	PosterPath      string          `json:"posterPath"`
+	BackdropPath    string          `json:"backdropPath"`
+	ReleaseDate     string          `json:"releaseDate"`
+	FirstAirDate    string          `json:"firstAirDate"`
+	NumberOfSeasons int             `json:"numberOfSeasons"`
+	Seasons         []CatalogSeason `json:"seasons"`
+	Genres          []struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+	} `json:"genres"`
+	ExternalIDs struct {
 		IMDBID string `json:"imdbId"`
 	} `json:"externalIds"`
 }
@@ -119,7 +136,7 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	if kind != "tv" {
 		kind = "movie"
 	}
-	d, e := s.details(ctx, kind, x.Media.TMDBID)
+	d, e := s.Catalog(ctx, kind, x.Media.TMDBID)
 	if e != nil {
 		s.Log.Error("seerr details", "request", x.ID, "error", e)
 		return
@@ -142,7 +159,7 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	if externalID == "" {
 		externalID = d.ExternalIDs.IMDBID
 	}
-	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Seasons: seasons, Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Overview: d.Overview, PosterPath: d.PosterPath, BackdropPath: d.BackdropPath, Seasons: seasons, Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	s.Log.Info("seerr media details obtained", "component", "seerr", "request", x.ID, "title", title, "type", kind, "imdb_id", externalID, "tmdb_id", x.Media.TMDBID, "seasons", seasons)
 	if e = s.Store.UpsertMedia(m); e == nil {
 		e = s.Resolver.Resolve(ctx, m)
@@ -157,20 +174,29 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	}
 	s.Log.Info("seerr request processing completed", "component", "seerr", "request", x.ID, "title", title, "status", m.Status, "duration", time.Since(started).String())
 }
-func (s *Seerr) details(ctx context.Context, kind string, id int64) (details, error) {
+func (s *Seerr) Catalog(ctx context.Context, kind string, id int64) (CatalogDetails, error) {
+	if kind != "movie" && kind != "tv" {
+		return CatalogDetails{}, fmt.Errorf("media type must be movie or tv")
+	}
 	cfg := s.currentConfig()
+	if cfg.SeerrURL == "" || cfg.SeerrAPIKey == "" {
+		return CatalogDetails{}, fmt.Errorf("Seerr is not configured as a catalog source")
+	}
 	u := fmt.Sprintf("%s/api/v1/%s/%d", cfg.SeerrURL, kind, id)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return CatalogDetails{}, err
+	}
 	req.Header.Set("X-Api-Key", cfg.SeerrAPIKey)
 	resp, e := s.Client.Do(req)
 	if e != nil {
-		return details{}, e
+		return CatalogDetails{}, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return details{}, fmt.Errorf("seerr details: %s", resp.Status)
+		return CatalogDetails{}, fmt.Errorf("seerr details: %s", resp.Status)
 	}
-	var d details
+	var d CatalogDetails
 	e = json.NewDecoder(resp.Body).Decode(&d)
 	return d, e
 }

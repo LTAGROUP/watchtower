@@ -62,3 +62,28 @@ func TestOpenRepairsLegacyMediaIDs(t *testing.T) {
 		t.Fatalf("repaired media could not be reset: %#v", reset)
 	}
 }
+
+func TestDeleteMediaRemovesLibraryFiles(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertMedia(&model.Media{ID: 12, RequestID: 44, Status: "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddFiles(&model.File{ID: "file", MediaID: 12}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkProcessed(44); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteMedia(12); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.MediaByID(12); ok || len(s.Files()) != 0 {
+		t.Fatal("media or files remained after delete")
+	}
+	if !s.IsProcessed(44) {
+		t.Fatal("Seerr processed marker should remain after deletion")
+	}
+}

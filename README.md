@@ -9,12 +9,13 @@ This project is intended for media you are authorized to access. It does not byp
 - TorBox and AllDebrid provider adapters
 - direct aggregation of Torrentio, Comet, StremThru, and other Stremio-compatible scraper endpoints
 - automatic polling of approved Seerr movie and TV requests
+- direct WatchTower requests from the dashboard without creating a Seerr request
 - independent 2160p and 1080p release selection
 - season-pack expansion into Plex-compatible episode paths
 - cached-only selection by default
 - HTTP Range and HEAD passthrough for seeking and Plex analysis
 - bounded sparse-file caching for fast Plex analysis, random seeks, and repeated playback
-- automatic URL regeneration and retry after stale links, rate limits, timeouts, and provider 5xx responses
+- automatic URL regeneration plus in-place repair and provider fallback when a stored debrid item disappears
 - persistent JSON metadata with atomic updates; no media payload storage
 - a read-only WebDAV-to-FUSE mount using rclone
 - an authenticated operations dashboard for requests, discovery, library files, queue state, retries, and live settings
@@ -22,9 +23,9 @@ This project is intended for media you are authorized to access. It does not byp
 ## Data flow
 
 ```text
-Seerr request -> WatchTower -> configured scraper addons -> TorBox / AllDebrid
-                       |                         |
-Plex <- host mount <- rclone <- WebDAV/Range proxy
+Seerr catalog ----> WatchTower dashboard request ----> scraper addons ----> TorBox / AllDebrid
+Seerr request ----> WatchTower poller -----------------------^                    |
+Plex <------------ host mount <---- rclone <---- WebDAV/Range proxy <-------------+
 ```
 
 The directory layout is conventional Plex naming:
@@ -69,7 +70,11 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
 
    Use scraper-only addon configurations and do not embed debrid credentials in these URLs. WatchTower performs provider cache checks and creates stream links itself.
 
-7. Configure Seerr with working Radarr/Sonarr service entries so its UI can create and approve requests. Disable automatic searching on those entries (`preventSearch`) to avoid a second download workflow. WatchTower polls approved requests and updates Seerr media status when files are ready.
+7. WatchTower uses Seerr as the discovery and metadata catalog, but requests made
+   from the WatchTower dashboard are queued directly in WatchTower. Existing
+   approved Seerr requests can still be imported by the poller. If you use that
+   legacy path, configure working Radarr/Sonarr service entries with automatic
+   searching disabled (`preventSearch`) to avoid a second download workflow.
 
 Check operation with:
 

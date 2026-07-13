@@ -3,19 +3,22 @@ package model
 import "time"
 
 type Media struct {
-	ID         int64     `json:"id"`
-	RequestID  int64     `json:"requestId"`
-	Type       string    `json:"type"`
-	TMDBID     int64     `json:"tmdbId"`
-	ExternalID string    `json:"externalId"`
-	Title      string    `json:"title"`
-	Year       int       `json:"year"`
-	Seasons    []int     `json:"seasons,omitempty"`
-	Status     string    `json:"status"`
-	Error      string    `json:"error,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
-	ScrapedAt  time.Time `json:"scrapedAt,omitempty"`
+	ID           int64     `json:"id"`
+	RequestID    int64     `json:"requestId"`
+	Type         string    `json:"type"`
+	TMDBID       int64     `json:"tmdbId"`
+	ExternalID   string    `json:"externalId"`
+	Title        string    `json:"title"`
+	Year         int       `json:"year"`
+	Overview     string    `json:"overview,omitempty"`
+	PosterPath   string    `json:"posterPath,omitempty"`
+	BackdropPath string    `json:"backdropPath,omitempty"`
+	Seasons      []int     `json:"seasons,omitempty"`
+	Status       string    `json:"status"`
+	Error        string    `json:"error,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+	ScrapedAt    time.Time `json:"scrapedAt,omitempty"`
 }
 
 type File struct {
