@@ -17,6 +17,12 @@ type fixedSearcher struct {
 	releases []model.Release
 }
 
+type panicSearcher struct{}
+
+func (panicSearcher) Search(context.Context, scraper.Query, int) ([]model.Release, error) {
+	panic("unreleased media must not be scraped")
+}
+
 func (s fixedSearcher) Search(context.Context, scraper.Query, int) ([]model.Release, error) {
 	return append([]model.Release(nil), s.releases...), nil
 }
@@ -66,6 +72,21 @@ func TestQualityAliases(t *testing.T) {
 	}
 }
 
+func TestResolverDefersUnreleasedMediaWithoutScraping(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 11, Type: "movie", Title: "Coming Soon", ReleaseDate: time.Now().UTC().AddDate(0, 0, 2).Format("2006-01-02")}
+	resolver := &Resolver{Store: st, Scraper: panicSearcher{}}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if media.Status != "unreleased" || len(st.FilesForMedia(media.ID)) != 0 {
+		t.Fatalf("unexpected deferred media: %#v", media)
+	}
+}
+
 func TestResolverAtomicallyReplacesSuccessfulSlotsAndKeepsFailedSlots(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
@@ -80,6 +101,7 @@ func TestResolverAtomicallyReplacesSuccessfulSlotsAndKeepsFailedSlots(t *testing
 	if err := st.AddFiles(old2160, old1080); err != nil {
 		t.Fatal(err)
 	}
+	libraryChanges := 0
 	resolver := &Resolver{
 		Config:  config.Config{Qualities: []string{"2160p", "1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
 		Store:   st,
@@ -87,6 +109,7 @@ func TestResolverAtomicallyReplacesSuccessfulSlotsAndKeepsFailedSlots(t *testing
 		Providers: map[string]debrid.Provider{
 			"test": fixedProvider{resolved: model.Resolved{ItemID: "new-item", Cached: true, Files: []model.RemoteFile{{ID: "new-file", Name: "Example.2160p.mkv", Size: 100}}}},
 		},
+		LibraryChanged: func() { libraryChanges++ },
 	}
 	if err := resolver.Resolve(context.Background(), media); err != nil {
 		t.Fatal(err)
@@ -103,5 +126,8 @@ func TestResolverAtomicallyReplacesSuccessfulSlotsAndKeepsFailedSlots(t *testing
 	files := st.FilesForMedia(media.ID)
 	if len(files) != 2 {
 		t.Fatalf("expected one replacement and one retained file, got %#v", files)
+	}
+	if libraryChanges != 1 {
+		t.Fatalf("expected one library change notification, got %d", libraryChanges)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/config"
+	"github.com/LTAGROUP/watchtower/internal/logging"
 	"github.com/LTAGROUP/watchtower/internal/model"
 	"github.com/LTAGROUP/watchtower/internal/scraper"
 	"github.com/LTAGROUP/watchtower/internal/service"
@@ -22,6 +24,30 @@ type failingCatalogSearcher struct{}
 
 func (failingCatalogSearcher) Search(context.Context, scraper.Query, int) ([]model.Release, error) {
 	return nil, errors.New("stop after direct request persistence")
+}
+
+func TestLogsReturnsBufferedEntries(t *testing.T) {
+	logs := logging.NewBuffer(25)
+	slog.New(logs.Handler(slog.LevelDebug)).Warn("provider unavailable", "component", "resolver", "provider", "torbox")
+	handler := (&Handler{Logs: logs, Username: "admin", Password: "secret"}).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/logs", nil)
+	req.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", response.Code)
+	}
+	var result struct {
+		Entries  []logging.Entry `json:"entries"`
+		Capacity int             `json:"capacity"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Capacity != 25 || len(result.Entries) != 1 || result.Entries[0].Component != "resolver" || result.Entries[0].Fields["provider"] != "torbox" {
+		t.Fatalf("unexpected log response: %#v", result)
+	}
 }
 
 func TestDashboardRequiresBasicAuthAndReturnsSummary(t *testing.T) {
@@ -111,7 +137,7 @@ func TestCreateRequestQueuesDirectlyWithoutPostingToSeerr(t *testing.T) {
 			http.Error(w, "unexpected", http.StatusBadRequest)
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":99,"name":"Direct Show","overview":"A direct request.","firstAirDate":"2025-01-02","posterPath":"/poster.jpg","externalIds":{"imdbId":"tt123"},"seasons":[{"seasonNumber":1,"name":"Season 1","episodeCount":8},{"seasonNumber":2,"name":"Season 2","episodeCount":6}]}`))
+		_, _ = w.Write([]byte(`{"id":99,"name":"Direct Show","overview":"A direct request.","firstAirDate":"2025-01-02","posterPath":"/poster.jpg","externalIds":{"imdbId":"tt123"},"seasons":[{"seasonNumber":1,"name":"Season 1","airDate":"2025-01-02","episodeCount":8},{"seasonNumber":2,"name":"Season 2","airDate":"2025-06-01","episodeCount":6}]}`))
 	}))
 	defer catalog.Close()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))

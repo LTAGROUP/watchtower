@@ -19,13 +19,14 @@ import (
 )
 
 type Seerr struct {
-	Config   config.Config
-	Settings func() config.Config
-	Store    *store.Store
-	Resolver *Resolver
-	Client   *http.Client
-	Log      *slog.Logger
-	inflight sync.Map
+	Config          config.Config
+	Settings        func() config.Config
+	Store           *store.Store
+	Resolver        *Resolver
+	Client          *http.Client
+	Log             *slog.Logger
+	inflight        sync.Map
+	releaseInflight sync.Map
 }
 type seerrPage struct {
 	Results []seerrRequest `json:"results"`
@@ -47,9 +48,21 @@ type seerrRequest struct {
 type CatalogSeason struct {
 	SeasonNumber int    `json:"seasonNumber"`
 	Name         string `json:"name"`
+	AirDate      string `json:"airDate"`
 	EpisodeCount int    `json:"episodeCount"`
 	Overview     string `json:"overview"`
 	PosterPath   string `json:"posterPath"`
+}
+
+type CatalogEpisode struct {
+	EpisodeNumber int    `json:"episodeNumber"`
+	AirDate       string `json:"airDate"`
+}
+
+type CatalogSeasonDetails struct {
+	SeasonNumber int              `json:"seasonNumber"`
+	AirDate      string           `json:"airDate"`
+	Episodes     []CatalogEpisode `json:"episodes"`
 }
 
 type CatalogDetails struct {
@@ -88,6 +101,7 @@ func (s *Seerr) Run(ctx context.Context) {
 	}
 }
 func (s *Seerr) poll(ctx context.Context) {
+	defer s.releaseDue(ctx)
 	cfg := s.currentConfig()
 	if cfg.SeerrURL == "" || cfg.SeerrAPIKey == "" {
 		return
@@ -159,7 +173,7 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	if externalID == "" {
 		externalID = d.ExternalIDs.IMDBID
 	}
-	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Overview: d.Overview, PosterPath: d.PosterPath, BackdropPath: d.BackdropPath, Seasons: seasons, Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Overview: d.Overview, PosterPath: d.PosterPath, BackdropPath: d.BackdropPath, Seasons: seasons, ReleaseDate: s.MediaReleaseDate(ctx, kind, x.Media.TMDBID, d, seasons), Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	s.Log.Info("seerr media details obtained", "component", "seerr", "request", x.ID, "title", title, "type", kind, "imdb_id", externalID, "tmdb_id", x.Media.TMDBID, "seasons", seasons)
 	if e = s.Store.UpsertMedia(m); e == nil {
 		e = s.Resolver.Resolve(ctx, m)
@@ -168,9 +182,11 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 		s.Log.Error("resolve", "request", x.ID, "error", e)
 		return
 	}
-	if m.Status == "ready" || m.Status == "partial" {
+	if m.Status == "ready" || m.Status == "partial" || m.Status == "unreleased" {
 		_ = s.Store.MarkProcessed(x.ID)
-		s.markAvailable(ctx, x.Media.ID)
+		if m.Status != "unreleased" {
+			s.markAvailable(ctx, x.Media.ID)
+		}
 	}
 	s.Log.Info("seerr request processing completed", "component", "seerr", "request", x.ID, "title", title, "status", m.Status, "duration", time.Since(started).String())
 }
@@ -199,6 +215,80 @@ func (s *Seerr) Catalog(ctx context.Context, kind string, id int64) (CatalogDeta
 	var d CatalogDetails
 	e = json.NewDecoder(resp.Body).Decode(&d)
 	return d, e
+}
+
+func (s *Seerr) CatalogSeason(ctx context.Context, id int64, season int) (CatalogSeasonDetails, error) {
+	if id <= 0 || season <= 0 {
+		return CatalogSeasonDetails{}, fmt.Errorf("TV and season IDs must be positive")
+	}
+	cfg := s.currentConfig()
+	if cfg.SeerrURL == "" || cfg.SeerrAPIKey == "" {
+		return CatalogSeasonDetails{}, fmt.Errorf("Seerr is not configured as a catalog source")
+	}
+	u := fmt.Sprintf("%s/api/v1/tv/%d/season/%d", cfg.SeerrURL, id, season)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return CatalogSeasonDetails{}, err
+	}
+	req.Header.Set("X-Api-Key", cfg.SeerrAPIKey)
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return CatalogSeasonDetails{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return CatalogSeasonDetails{}, fmt.Errorf("seerr season details: %s", resp.Status)
+	}
+	var details CatalogSeasonDetails
+	err = json.NewDecoder(resp.Body).Decode(&details)
+	return details, err
+}
+
+// MediaReleaseDate returns the first day any requested content is expected to
+// be available. TV season dates represent the first episode; when Seerr omits
+// that summary field, the episode list is used as a fallback.
+func (s *Seerr) MediaReleaseDate(ctx context.Context, kind string, id int64, details CatalogDetails, seasons []int) string {
+	if kind == "movie" {
+		return validDate(details.ReleaseDate)
+	}
+	if kind != "tv" {
+		return ""
+	}
+	if len(seasons) == 0 {
+		return validDate(details.FirstAirDate)
+	}
+	var dates []string
+	for _, wanted := range seasons {
+		date := ""
+		for _, season := range details.Seasons {
+			if season.SeasonNumber == wanted {
+				date = validDate(season.AirDate)
+				break
+			}
+		}
+		if date == "" {
+			season, err := s.CatalogSeason(ctx, id, wanted)
+			if err == nil {
+				date = validDate(season.AirDate)
+				for _, episode := range season.Episodes {
+					date = earlierDate(date, validDate(episode.AirDate))
+				}
+			} else if s.Log != nil {
+				s.Log.Warn("Seerr episode release dates unavailable", "component", "seerr", "tmdb_id", id, "season", wanted, "error", err)
+			}
+		}
+		if date != "" {
+			dates = append(dates, date)
+		}
+	}
+	date := ""
+	for _, candidate := range dates {
+		date = earlierDate(date, candidate)
+	}
+	if date == "" {
+		date = validDate(details.FirstAirDate)
+	}
+	return date
 }
 func (s *Seerr) markAvailable(ctx context.Context, id int64) {
 	cfg := s.currentConfig()
@@ -266,7 +356,14 @@ func (s *Seerr) Discover(ctx context.Context, options DiscoverOptions) (json.Raw
 			}
 		}
 	}
-	return s.seerrJSON(ctx, http.MethodGet, endpoint+"?"+values.Encode(), nil)
+	query := values.Encode()
+	if endpoint == "/api/v1/search" {
+		// Seerr's OpenAPI validator follows RFC 3986 and rejects the '+' that
+		// url.Values uses for spaces. A literal plus is already encoded as %2B,
+		// so replacing separators here preserves the user's query.
+		query = strings.ReplaceAll(query, "+", "%20")
+	}
+	return s.seerrJSON(ctx, http.MethodGet, endpoint+"?"+query, nil)
 }
 
 func (s *Seerr) CreateRequest(ctx context.Context, input CreateRequestInput) (json.RawMessage, error) {
@@ -298,6 +395,31 @@ func (s *Seerr) Retry(ctx context.Context, item *model.Media) error {
 		s.markAvailable(ctx, item.ID)
 	}
 	return nil
+}
+
+func (s *Seerr) releaseDue(ctx context.Context) {
+	for _, media := range s.Store.Media() {
+		if media == nil || media.Status != "unreleased" || IsUnreleased(media, time.Now()) {
+			continue
+		}
+		if _, loaded := s.releaseInflight.LoadOrStore(media.ID, struct{}{}); loaded {
+			continue
+		}
+		go func(id int64) {
+			defer s.releaseInflight.Delete(id)
+			item, err := s.Store.ResetMedia(id)
+			if err == nil {
+				if item.RequestID > 0 {
+					err = s.Retry(context.Background(), item)
+				} else {
+					err = s.Resolver.Resolve(context.Background(), item)
+				}
+			}
+			if err != nil && s.Log != nil {
+				s.Log.Error("released media retry failed", "component", "seerr", "media", id, "error", err)
+			}
+		}(media.ID)
+	}
 }
 
 func (s *Seerr) seerrJSON(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
@@ -346,4 +468,22 @@ func yearOf(s string) int {
 		return v
 	}
 	return 0
+}
+
+func validDate(value string) string {
+	if len(value) < len("2006-01-02") {
+		return ""
+	}
+	value = value[:len("2006-01-02")]
+	if _, err := time.Parse("2006-01-02", value); err != nil {
+		return ""
+	}
+	return value
+}
+
+func earlierDate(current, candidate string) string {
+	if candidate != "" && (current == "" || candidate < current) {
+		return candidate
+	}
+	return current
 }

@@ -1,7 +1,8 @@
 const state = {
   route: 'dashboard', summary: null, media: [], files: [], queue: [], settings: null,
   libraryTab: 'media', detailCache: new Map(),
-  discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true }
+  discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true },
+  logs: { entries: [], capacity: 0, loading: false }
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -29,14 +30,15 @@ function showNotice(message, error = false) {
 
 function route() {
   const next = (location.hash || '#dashboard').slice(1).split('?')[0];
-  const valid = ['dashboard','discover','library','queue','settings'];
+  const valid = ['dashboard','discover','library','queue','logs','settings'];
   state.route = valid.includes(next) ? next : 'dashboard';
   $$('.page').forEach(page => page.classList.toggle('active', page.id === `${state.route}-page`));
   $$('.nav a').forEach(link => link.classList.toggle('active', link.dataset.route === state.route));
-  const labels = {dashboard:['Operations','Overview'], discover:['Catalog','Discover'], library:['Collection','Library'], queue:['Pipeline','Queue'], settings:['Configuration','Settings']};
+  const labels = {dashboard:['Operations','Overview'], discover:['Catalog','Discover'], library:['Collection','Library'], queue:['Pipeline','Queue'], logs:['Diagnostics','Logs'], settings:['Configuration','Settings']};
   $('#page-eyebrow').textContent = labels[state.route][0];
   $('#page-title').textContent = labels[state.route][1];
   if (state.route === 'discover' && state.discover.results.length === 0) loadDiscover(true);
+  if (state.route === 'logs' && state.logs.entries.length === 0) loadLogs();
   if (state.route === 'settings' && !state.settings) loadSettings();
 }
 
@@ -67,10 +69,10 @@ function renderDashboard() {
     ['Indexed titles', s.indexed, 'Titles tracked by WatchTower', '◆'],
     ['Scraped', s.scraped, 'Catalog searches completed', '⌁'],
     ['Plex files', s.files, formatBytes(s.bytes), '▦'],
-    ['Ready', s.statuses?.ready || 0, `${s.statuses?.partial || 0} partial · ${s.statuses?.failed || 0} failed`, '✓']
+    ['Ready', s.statuses?.ready || 0, `${s.statuses?.unreleased || 0} unreleased · ${s.statuses?.failed || 0} failed`, '✓']
   ];
   $('#metric-grid').innerHTML = metrics.map(item => `<article class="metric-card"><span class="metric-label">${escapeHTML(item[0])}</span><strong class="metric-value">${Number(item[1]).toLocaleString()}</strong><span class="metric-note">${escapeHTML(item[2])}</span><span class="metric-accent">${item[3]}</span></article>`).join('');
-  const statuses = ['queued','scraping','resolving','ready','partial','failed'];
+  const statuses = ['queued','unreleased','scraping','resolving','ready','partial','failed'];
   const total = Math.max(1, statuses.reduce((sum, key) => sum + (s.statuses?.[key] || 0), 0));
   $('#pipeline-total').textContent = `${s.indexed} tracked`;
   $('#pipeline-bars').innerHTML = statuses.map(key => `<div class="pipeline-row ${key}"><span>${key}</span><progress max="${total}" value="${s.statuses?.[key] || 0}"></progress><span>${s.statuses?.[key] || 0}</span></div>`).join('');
@@ -103,11 +105,64 @@ function libraryCard(item) {
 }
 
 function renderQueue() {
-  const counts = {active:0, partial:0, failed:0, total:state.queue.length};
-  state.queue.forEach(item => { if (['queued','scraping','resolving'].includes(item.status)) counts.active++; if (item.status === 'partial') counts.partial++; if (item.status === 'failed') counts.failed++; });
-  $('#queue-summary').innerHTML = [['Active',counts.active],['Partial',counts.partial],['Failed',counts.failed],['Visible',counts.total]].map(([label,value]) => `<div class="queue-stat"><strong>${value}</strong><small>${label}</small></div>`).join('');
+  const counts = {active:0, unreleased:0, partial:0, failed:0};
+  state.queue.forEach(item => { if (['queued','scraping','resolving'].includes(item.status)) counts.active++; if (item.status === 'unreleased') counts.unreleased++; if (item.status === 'partial') counts.partial++; if (item.status === 'failed') counts.failed++; });
+  $('#queue-summary').innerHTML = [['Active',counts.active],['Unreleased',counts.unreleased],['Partial',counts.partial],['Failed',counts.failed]].map(([label,value]) => `<div class="queue-stat"><strong>${value}</strong><small>${label}</small></div>`).join('');
   const list = [...state.queue].sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-  $('#queue-list').innerHTML = list.length ? list.map(item => `<article class="queue-card"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><h3>${escapeHTML(item.title)} ${item.year ? `<span class="muted">(${item.year})</span>` : ''}</h3><p>${item.error ? escapeHTML(item.error) : `${item.seasons?.length ? `Seasons ${item.seasons.join(', ')} · ` : ''}updated ${timeAgo(item.updatedAt)}`}</p></div><div class="queue-actions"><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span><button class="button ghost" data-reset-id="${item.id}">Retry</button></div></article>`).join('') : '<div class="panel empty-state">The queue is clear. Everything tracked is ready.</div>';
+  $('#queue-list').innerHTML = list.length ? list.map(item => `<article class="queue-card"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><h3>${escapeHTML(item.title)} ${item.year ? `<span class="muted">(${item.year})</span>` : ''}</h3><p>${item.status === 'unreleased' && item.releaseDate ? `Releases ${formatDate(item.releaseDate)} · WatchTower will retry automatically` : item.error ? escapeHTML(item.error) : `${item.seasons?.length ? `Seasons ${item.seasons.join(', ')} · ` : ''}updated ${timeAgo(item.updatedAt)}`}</p></div><div class="queue-actions"><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span>${item.status === 'unreleased' ? '' : `<button class="button ghost" data-reset-id="${item.id}">Retry</button>`}</div></article>`).join('') : '<div class="panel empty-state">The queue is clear. Everything tracked is ready.</div>';
+}
+
+async function loadLogs() {
+  if (state.logs.loading) return;
+  state.logs.loading = true;
+  const refresh = $('#log-refresh');
+  if (refresh) refresh.disabled = true;
+  try {
+    const data = await api('/api/v1/logs');
+    state.logs.entries = data.entries || [];
+    state.logs.capacity = data.capacity || 0;
+    updateLogComponents();
+    renderLogs();
+    $('#log-updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'})}`;
+  } catch (error) {
+    showNotice(error.message, true);
+  } finally {
+    state.logs.loading = false;
+    if (refresh) refresh.disabled = false;
+  }
+}
+
+function updateLogComponents() {
+  const select = $('#log-component');
+  const selected = select.value;
+  const components = [...new Set(state.logs.entries.map(entry => entry.component || 'core'))].sort((a,b) => a.localeCompare(b));
+  select.innerHTML = '<option value="">All components</option>' + components.map(component => `<option value="${escapeHTML(component)}">${escapeHTML(component)}</option>`).join('');
+  if (components.includes(selected)) select.value = selected;
+}
+
+function renderLogs() {
+  const query = $('#log-search').value.trim().toLowerCase();
+  const level = $('#log-level').value;
+  const component = $('#log-component').value;
+  const sort = $('#log-sort').value;
+  const severity = {error:4, warn:3, info:2, debug:1};
+  const entries = state.logs.entries.filter(entry => {
+    const fields = Object.entries(entry.fields || {}).map(([key,value]) => `${key} ${value}`).join(' ');
+    const haystack = `${entry.timestamp} ${entry.level} ${entry.component} ${entry.message} ${fields}`.toLowerCase();
+    return (!query || haystack.includes(query)) && (!level || entry.level === level) && (!component || entry.component === component);
+  }).sort((a,b) => {
+    if (sort === 'oldest') return new Date(a.timestamp) - new Date(b.timestamp) || Number(a.id) - Number(b.id);
+    if (sort === 'level') return (severity[b.level] || 0) - (severity[a.level] || 0) || new Date(b.timestamp) - new Date(a.timestamp);
+    return new Date(b.timestamp) - new Date(a.timestamp) || Number(b.id) - Number(a.id);
+  });
+  const total = state.logs.entries.length;
+  const retained = state.logs.capacity ? ` · retaining ${Math.min(total, state.logs.capacity).toLocaleString()} of ${state.logs.capacity.toLocaleString()}` : '';
+  $('#log-count').textContent = `${entries.length.toLocaleString()} of ${total.toLocaleString()} entries${retained}`;
+  $('#log-body').innerHTML = entries.length ? entries.map(entry => {
+    const levelName = ['debug','info','warn','error'].includes(entry.level) ? entry.level : 'info';
+    const fields = Object.entries(entry.fields || {}).map(([key,value]) => `<span class="log-field"><b>${escapeHTML(key)}</b>=${escapeHTML(value)}</span>`).join('');
+    return `<tr><td class="log-time" title="${escapeHTML(entry.timestamp)}">${escapeHTML(formatLogTime(entry.timestamp))}</td><td><span class="log-level ${levelName}">${escapeHTML(entry.level)}</span></td><td><span class="log-component">${escapeHTML(entry.component || 'core')}</span></td><td class="log-event"><strong>${escapeHTML(entry.message)}</strong>${fields ? `<div class="log-fields">${fields}</div>` : ''}</td></tr>`;
+  }).join('') : emptyRow(4, total ? 'No log entries match these filters.' : 'No log entries have been recorded yet.');
 }
 
 async function loadDiscover(reset = false) {
@@ -284,6 +339,8 @@ async function loadSettings() {
     state.settings = data.settings;
     const form = $('#settings-form'); const s = state.settings;
     form.elements.seerrUrl.value = s.seerrUrl || '';
+    form.elements.plexUrl.value = s.plexUrl || '';
+    form.elements.plexScanDelay.value = s.plexScanDelay || '45s';
     form.elements.providers.value = (s.providers || []).join(', ');
     form.elements.qualities.value = (s.qualities || []).join(', ');
     form.elements.pollInterval.value = s.pollInterval || '';
@@ -295,6 +352,8 @@ async function loadSettings() {
     form.elements.stremioAddons.value = (s.stremioAddons || []).join('\n');
     $('#seerr-state').textContent = s.seerrApiKeyConfigured && s.seerrUrl ? 'Configured' : 'Incomplete';
     $('#seerr-state').classList.toggle('missing', !(s.seerrApiKeyConfigured && s.seerrUrl));
+    $('#plex-state').textContent = s.plexTokenConfigured && s.plexUrl ? 'Configured' : 'Optional';
+    $('#plex-state').classList.toggle('missing', !(s.plexTokenConfigured && s.plexUrl));
   } catch (error) { showNotice(error.message, true); }
 }
 
@@ -302,13 +361,13 @@ async function saveSettings(event) {
   event.preventDefault();
   const form = event.currentTarget; const submit = form.querySelector('[type=submit]');
   const split = value => value.split(/[,\n]/).map(v => v.trim()).filter(Boolean);
-  const payload = {seerrUrl:form.elements.seerrUrl.value.trim(), providers:split(form.elements.providers.value), qualities:split(form.elements.qualities.value), stremioAddons:split(form.elements.stremioAddons.value), pollInterval:form.elements.pollInterval.value.trim(), resolveTimeout:form.elements.resolveTimeout.value.trim(), streamUrlTtl:form.elements.streamUrlTtl.value.trim(), minSeeders:Number(form.elements.minSeeders.value), maxResults:Number(form.elements.maxResults.value), allowUncached:form.elements.allowUncached.checked};
-  ['seerrApiKey','torBoxToken','allDebridToken'].forEach(name => { if (form.elements[name].value.trim()) payload[name] = form.elements[name].value.trim(); });
+  const payload = {seerrUrl:form.elements.seerrUrl.value.trim(), plexUrl:form.elements.plexUrl.value.trim(), plexScanDelay:form.elements.plexScanDelay.value.trim(), providers:split(form.elements.providers.value), qualities:split(form.elements.qualities.value), stremioAddons:split(form.elements.stremioAddons.value), pollInterval:form.elements.pollInterval.value.trim(), resolveTimeout:form.elements.resolveTimeout.value.trim(), streamUrlTtl:form.elements.streamUrlTtl.value.trim(), minSeeders:Number(form.elements.minSeeders.value), maxResults:Number(form.elements.maxResults.value), allowUncached:form.elements.allowUncached.checked};
+  ['seerrApiKey','plexToken','torBoxToken','allDebridToken'].forEach(name => { if (form.elements[name].value.trim()) payload[name] = form.elements[name].value.trim(); });
   submit.disabled = true;
   try {
     const result = await api('/api/v1/settings', {method:'PUT', body:JSON.stringify(payload)});
     state.settings = result.settings;
-    ['seerrApiKey','torBoxToken','allDebridToken'].forEach(name => form.elements[name].value = '');
+    ['seerrApiKey','plexToken','torBoxToken','allDebridToken'].forEach(name => form.elements[name].value = '');
     showNotice('Settings saved and applied.'); await loadSettings();
   } catch (error) { showNotice(error.message, true); }
   finally { submit.disabled = false; }
@@ -330,12 +389,19 @@ function lastPath(path = '') { return String(path).split('/').pop(); }
 function emptyRow(columns, message) { return `<tr><td colspan="${columns}" class="empty-state">${escapeHTML(message)}</td></tr>`; }
 function formatBytes(bytes = 0) { if (!bytes) return '0 B'; const units=['B','KB','MB','GB','TB']; const i=Math.min(Math.floor(Math.log(bytes)/Math.log(1024)),4); return `${(bytes/Math.pow(1024,i)).toFixed(i > 2 ? 1 : 0)} ${units[i]}`; }
 function timeAgo(value) { const seconds = Math.max(0, (Date.now() - new Date(value).getTime()) / 1000); if (seconds < 60) return 'just now'; if (seconds < 3600) return `${Math.floor(seconds/60)}m ago`; if (seconds < 86400) return `${Math.floor(seconds/3600)}h ago`; return `${Math.floor(seconds/86400)}d ago`; }
+function formatDate(value) { const date = new Date(`${value}T00:00:00`); return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString(undefined, {year:'numeric', month:'short', day:'numeric'}); }
+function formatLogTime(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'}); }
 
 window.addEventListener('hashchange', route);
-$('#refresh-button').addEventListener('click', () => refreshAll());
+$('#refresh-button').addEventListener('click', () => state.route === 'logs' ? loadLogs() : refreshAll());
 $('#discover-form').addEventListener('submit', event => { event.preventDefault(); loadDiscover(true); });
 $('#discover-type').addEventListener('change', updateGenres);
 $('#library-search').addEventListener('input', renderLibrary);
+$('#log-search').addEventListener('input', renderLogs);
+$('#log-level').addEventListener('change', renderLogs);
+$('#log-component').addEventListener('change', renderLogs);
+$('#log-sort').addEventListener('change', renderLogs);
+$('#log-refresh').addEventListener('click', loadLogs);
 $$('[data-library-tab]').forEach(tab => tab.addEventListener('click', () => { state.libraryTab = tab.dataset.libraryTab; $$('[data-library-tab]').forEach(t => t.classList.toggle('active', t === tab)); renderLibrary(); }));
 $('#settings-form').addEventListener('submit', saveSettings);
 $('#request-form').addEventListener('submit', submitRequest);
@@ -372,3 +438,4 @@ observer.observe($('#discover-sentinel'));
 route();
 refreshAll(true);
 setInterval(() => refreshAll(true), 30000);
+setInterval(() => { if (state.route === 'logs' && $('#log-auto-refresh').checked) loadLogs(); }, 5000);
