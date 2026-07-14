@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/config"
+	"github.com/LTAGROUP/watchtower/internal/logging"
 	"github.com/LTAGROUP/watchtower/internal/model"
 	"github.com/LTAGROUP/watchtower/internal/service"
 	"github.com/LTAGROUP/watchtower/internal/store"
@@ -36,6 +37,7 @@ type Handler struct {
 	Username string
 	Password string
 	Log      *slog.Logger
+	Logs     *logging.Buffer
 	direct   sync.Map
 }
 
@@ -44,6 +46,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/summary", h.summary)
 	mux.HandleFunc("GET /api/v1/library", h.library)
 	mux.HandleFunc("GET /api/v1/queue", h.queue)
+	mux.HandleFunc("GET /api/v1/logs", h.logs)
 	mux.HandleFunc("GET /api/v1/settings", h.getSettings)
 	mux.HandleFunc("PUT /api/v1/settings", h.putSettings)
 	mux.HandleFunc("GET /api/v1/discover", h.discover)
@@ -58,10 +61,18 @@ func (h *Handler) Routes() http.Handler {
 	return h.basicAuth(securityHeaders(mux))
 }
 
+func (h *Handler) logs(w http.ResponseWriter, _ *http.Request) {
+	if h.Logs == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"entries": []logging.Entry{}, "capacity": 0})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": h.Logs.Entries(), "capacity": h.Logs.Capacity()})
+}
+
 func (h *Handler) summary(w http.ResponseWriter, _ *http.Request) {
 	media := h.Store.Media()
 	files := h.Store.Files()
-	statuses := map[string]int{"queued": 0, "scraping": 0, "resolving": 0, "ready": 0, "partial": 0, "failed": 0}
+	statuses := map[string]int{"queued": 0, "unreleased": 0, "scraping": 0, "resolving": 0, "ready": 0, "partial": 0, "failed": 0}
 	scraped := 0
 	var bytes int64
 	for _, item := range media {
@@ -166,7 +177,7 @@ func (h *Handler) createRequest(w http.ResponseWriter, r *http.Request) {
 		ID: directMediaID(input.MediaType, input.MediaID), Type: input.MediaType, TMDBID: input.MediaID,
 		ExternalID: externalID, Title: title, Year: year, Overview: details.Overview,
 		PosterPath: details.PosterPath, BackdropPath: details.BackdropPath,
-		Seasons: input.Seasons, Status: "queued", CreatedAt: now, UpdatedAt: now,
+		Seasons: input.Seasons, ReleaseDate: h.Seerr.MediaReleaseDate(r.Context(), input.MediaType, input.MediaID, details, input.Seasons), Status: "queued", CreatedAt: now, UpdatedAt: now,
 	}
 	if err := h.Store.UpsertMedia(item); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

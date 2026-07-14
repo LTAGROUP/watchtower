@@ -32,6 +32,7 @@ type Resolver struct {
 	ScraperFactory  func(config.Config) (scraper.Searcher, error)
 	Providers       map[string]debrid.Provider
 	ProviderFactory func(config.Config) map[string]debrid.Provider
+	LibraryChanged  func()
 	Log             *slog.Logger
 	repairMu        sync.Mutex
 	repairs         map[string]*repairCall
@@ -44,6 +45,15 @@ type repairCall struct {
 }
 
 func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
+	if IsUnreleased(m, time.Now()) {
+		m.Status = "unreleased"
+		m.Error = ""
+		m.UpdatedAt = time.Now().UTC()
+		if r.Log != nil {
+			r.Log.Info("media resolution deferred until release", "component", "resolver", "title", m.Title, "release_date", m.ReleaseDate)
+		}
+		return r.Store.UpsertMedia(m)
+	}
 	cfg := r.Config
 	if r.Settings != nil {
 		cfg = r.Settings()
@@ -184,6 +194,9 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 	}
 	m.UpdatedAt = time.Now().UTC()
 	err := r.Store.UpsertMedia(m)
+	if err == nil && total > 0 && r.LibraryChanged != nil {
+		r.LibraryChanged()
+	}
 	if r.Log != nil {
 		attrs := []any{"component", "resolver", "title", m.Title, "status", m.Status, "files_added", total, "duration", time.Since(started).String()}
 		if m.Error != "" {
@@ -197,6 +210,11 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		}
 	}
 	return err
+}
+
+func IsUnreleased(m *model.Media, now time.Time) bool {
+	date := validDate(m.ReleaseDate)
+	return date != "" && date > now.UTC().Format("2006-01-02")
 }
 
 func resolutionSlot(kind, quality string, season int) string {

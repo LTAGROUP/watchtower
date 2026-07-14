@@ -14,6 +14,7 @@ type Media struct {
 	PosterPath   string    `json:"posterPath,omitempty"`
 	BackdropPath string    `json:"backdropPath,omitempty"`
 	Seasons      []int     `json:"seasons,omitempty"`
+	ReleaseDate  string    `json:"releaseDate,omitempty"`
 	Status       string    `json:"status"`
 	Error        string    `json:"error,omitempty"`
 	CreatedAt    time.Time `json:"createdAt"`

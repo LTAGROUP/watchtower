@@ -13,9 +13,11 @@ type Config struct {
 	DashboardPassword, SettingsFile            string
 	PublicBaseURL, WebhookSecret               string
 	SeerrURL, SeerrAPIKey                      string
+	PlexURL, PlexToken                         string
 	TorBoxToken, AllDebridToken                string
 	Providers, Qualities, StremioAddons        []string
 	PollInterval, ResolveTimeout, StreamURLTTL time.Duration
+	PlexScanDelay                              time.Duration
 	MinSeeders                                 int
 	MaxResults                                 int
 	AllowUncached                              bool
@@ -29,11 +31,12 @@ func Load() Config {
 		PublicBaseURL: strings.TrimRight(env("PUBLIC_BASE_URL", "http://watchtower:8080"), "/"),
 		WebhookSecret: os.Getenv("WEBHOOK_SECRET"),
 		SeerrURL:      strings.TrimRight(os.Getenv("SEERR_URL"), "/"), SeerrAPIKey: os.Getenv("SEERR_API_KEY"),
+		PlexURL: strings.TrimRight(os.Getenv("PLEX_URL"), "/"), PlexToken: os.Getenv("PLEX_TOKEN"),
 		TorBoxToken: os.Getenv("TORBOX_TOKEN"), AllDebridToken: os.Getenv("ALLDEBRID_TOKEN"),
 		Providers: csv(env("PROVIDERS", "torbox,alldebrid")), Qualities: csv(env("QUALITIES", "2160p,1080p")),
 		StremioAddons: list(env("STREMIO_ADDONS", "torrentio|https://torrentio.strem.fun/manifest.json")),
 		PollInterval:  duration("SEERR_POLL_INTERVAL", 2*time.Minute), ResolveTimeout: duration("RESOLVE_TIMEOUT", 15*time.Minute),
-		StreamURLTTL: duration("STREAM_URL_TTL", 45*time.Minute), MinSeeders: integer("MIN_SEEDERS", 0),
+		StreamURLTTL: duration("STREAM_URL_TTL", 45*time.Minute), PlexScanDelay: duration("PLEX_SCAN_DELAY", 45*time.Second), MinSeeders: integer("MIN_SEEDERS", 0),
 		MaxResults: integer("MAX_RESULTS_PER_QUALITY", 20), AllowUncached: boolean("ALLOW_UNCACHED", false),
 	}
 }

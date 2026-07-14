@@ -9,6 +9,7 @@ This project is intended for media you are authorized to access. It does not byp
 - TorBox and AllDebrid provider adapters
 - direct aggregation of Torrentio, Comet, StremThru, and other Stremio-compatible scraper endpoints
 - automatic polling of approved Seerr movie and TV requests
+- release-date awareness that parks future movies and TV seasons as `unreleased` instead of repeatedly scraping them
 - direct WatchTower requests from the dashboard without creating a Seerr request
 - independent 2160p and 1080p release selection
 - season-pack expansion into Plex-compatible episode paths
@@ -19,6 +20,7 @@ This project is intended for media you are authorized to access. It does not byp
 - persistent JSON metadata with atomic updates; no media payload storage
 - a read-only WebDAV-to-FUSE mount using rclone
 - an authenticated operations dashboard for requests, discovery, library files, queue state, retries, and live settings
+- debounced Plex library refreshes after new virtual media files are published
 
 ## Data flow
 
@@ -62,6 +64,12 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
 
 5. Add `${MEDIA_MOUNT}/Movies` and `${MEDIA_MOUNT}/TV` as Plex library roots. If Plex itself runs in Docker, bind the same host path into its container with `rslave` or `rshared` propagation.
 
+   To trigger Plex scans automatically, set `PLEX_URL` and `PLEX_TOKEN` in
+   `.env`, or enter them on the WatchTower settings page. `PLEX_URL` must be
+   reachable from the WatchTower container, such as `http://plex:32400` when
+   both services share the Compose network. WatchTower waits for the rclone
+   directory cache, then requests a refresh of all Plex library sections.
+
 6. Configure scraper sources with `STREMIO_ADDONS`. Each entry uses `name|manifest-url` and entries are comma-separated. WatchTower removes the trailing `/manifest.json` and calls the standard Stremio `/stream/{type}/{id}.json` resource directly. The default uses Torrentio; configured Comet and StremThru manifest URLs can be added without code changes.
 
    ```env
@@ -99,6 +107,9 @@ The core port is intentionally not published. Add `ports: ["8080:8080"]` under `
 | `STREAM_URL_TTL` | `45m` | Proactive URL refresh interval |
 | `LOG_COLOR` | `true` | Use colors and text styling in console logs; set to `false` for plain-text log collectors |
 | `SEERR_POLL_INTERVAL` | `2m` | Approved-request polling interval |
+| `PLEX_URL` | empty | Plex server URL reachable from WatchTower |
+| `PLEX_TOKEN` | empty | Plex access token used only for library refresh requests |
+| `PLEX_SCAN_DELAY` | `45s` | Delay/batch window before refreshing Plex; should exceed rclone's directory cache time |
 | `VFS_CACHE_MAX_SIZE` | `20G` | Maximum transient rclone read cache size |
 | `VFS_CACHE_MAX_AGE` | `24h` | Evict cached chunks after their last access |
 | `VFS_READ_CHUNK_SIZE` | `4M` | Initial remote range-read size |

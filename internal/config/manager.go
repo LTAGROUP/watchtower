@@ -17,6 +17,9 @@ import (
 type EditableSettings struct {
 	SeerrURL       string   `json:"seerrUrl"`
 	SeerrAPIKey    string   `json:"seerrApiKey"`
+	PlexURL        string   `json:"plexUrl"`
+	PlexToken      string   `json:"plexToken"`
+	PlexScanDelay  string   `json:"plexScanDelay"`
 	TorBoxToken    string   `json:"torBoxToken"`
 	AllDebridToken string   `json:"allDebridToken"`
 	Providers      []string `json:"providers"`
@@ -33,6 +36,9 @@ type EditableSettings struct {
 type SettingsUpdate struct {
 	SeerrURL       string   `json:"seerrUrl"`
 	SeerrAPIKey    *string  `json:"seerrApiKey,omitempty"`
+	PlexURL        string   `json:"plexUrl"`
+	PlexToken      *string  `json:"plexToken,omitempty"`
+	PlexScanDelay  string   `json:"plexScanDelay"`
 	TorBoxToken    *string  `json:"torBoxToken,omitempty"`
 	AllDebridToken *string  `json:"allDebridToken,omitempty"`
 	Providers      []string `json:"providers"`
@@ -49,6 +55,9 @@ type SettingsUpdate struct {
 type PublicSettings struct {
 	SeerrURL              string   `json:"seerrUrl"`
 	SeerrAPIKeyConfigured bool     `json:"seerrApiKeyConfigured"`
+	PlexURL               string   `json:"plexUrl"`
+	PlexTokenConfigured   bool     `json:"plexTokenConfigured"`
+	PlexScanDelay         string   `json:"plexScanDelay"`
 	TorBoxConfigured      bool     `json:"torBoxConfigured"`
 	AllDebridConfigured   bool     `json:"allDebridConfigured"`
 	Providers             []string `json:"providers"`
@@ -86,8 +95,13 @@ func OpenManager(base Config) (*Manager, error) {
 }
 
 func editableFrom(c Config) EditableSettings {
+	plexScanDelay := c.PlexScanDelay
+	if plexScanDelay <= 0 {
+		plexScanDelay = 45 * time.Second
+	}
 	return EditableSettings{
 		SeerrURL: c.SeerrURL, SeerrAPIKey: c.SeerrAPIKey,
+		PlexURL: c.PlexURL, PlexToken: c.PlexToken, PlexScanDelay: plexScanDelay.String(),
 		TorBoxToken: c.TorBoxToken, AllDebridToken: c.AllDebridToken,
 		Providers: append([]string(nil), c.Providers...), Qualities: append([]string(nil), c.Qualities...),
 		StremioAddons: append([]string(nil), c.StremioAddons...),
@@ -102,12 +116,14 @@ func (m *Manager) Snapshot() Config {
 	c := m.base
 	s := m.settings
 	c.SeerrURL, c.SeerrAPIKey = strings.TrimRight(s.SeerrURL, "/"), s.SeerrAPIKey
+	c.PlexURL, c.PlexToken = strings.TrimRight(s.PlexURL, "/"), s.PlexToken
 	c.TorBoxToken, c.AllDebridToken = s.TorBoxToken, s.AllDebridToken
 	c.Providers, c.Qualities = append([]string(nil), s.Providers...), append([]string(nil), s.Qualities...)
 	c.StremioAddons = append([]string(nil), s.StremioAddons...)
 	c.PollInterval, _ = time.ParseDuration(s.PollInterval)
 	c.ResolveTimeout, _ = time.ParseDuration(s.ResolveTimeout)
 	c.StreamURLTTL, _ = time.ParseDuration(s.StreamURLTTL)
+	c.PlexScanDelay, _ = time.ParseDuration(s.PlexScanDelay)
 	c.MinSeeders, c.MaxResults, c.AllowUncached = s.MinSeeders, s.MaxResults, s.AllowUncached
 	return c
 }
@@ -116,6 +132,7 @@ func (m *Manager) Public() PublicSettings {
 	c := m.Snapshot()
 	return PublicSettings{
 		SeerrURL: c.SeerrURL, SeerrAPIKeyConfigured: c.SeerrAPIKey != "",
+		PlexURL: c.PlexURL, PlexTokenConfigured: c.PlexToken != "", PlexScanDelay: c.PlexScanDelay.String(),
 		TorBoxConfigured: c.TorBoxToken != "", AllDebridConfigured: c.AllDebridToken != "",
 		Providers: c.Providers, Qualities: c.Qualities, StremioAddons: c.StremioAddons,
 		PollInterval: c.PollInterval.String(), ResolveTimeout: c.ResolveTimeout.String(), StreamURLTTL: c.StreamURLTTL.String(),
@@ -128,6 +145,10 @@ func (m *Manager) Update(u SettingsUpdate) error {
 	defer m.mu.Unlock()
 	next := m.settings
 	next.SeerrURL = strings.TrimRight(strings.TrimSpace(u.SeerrURL), "/")
+	next.PlexURL = strings.TrimRight(strings.TrimSpace(u.PlexURL), "/")
+	if strings.TrimSpace(u.PlexScanDelay) != "" {
+		next.PlexScanDelay = strings.TrimSpace(u.PlexScanDelay)
+	}
 	next.Providers = normalizeList(u.Providers, true)
 	next.Qualities = normalizeList(u.Qualities, true)
 	next.StremioAddons = normalizeList(u.StremioAddons, false)
@@ -135,6 +156,9 @@ func (m *Manager) Update(u SettingsUpdate) error {
 	next.MinSeeders, next.MaxResults, next.AllowUncached = u.MinSeeders, u.MaxResults, u.AllowUncached
 	if u.SeerrAPIKey != nil && *u.SeerrAPIKey != "" {
 		next.SeerrAPIKey = strings.TrimSpace(*u.SeerrAPIKey)
+	}
+	if u.PlexToken != nil && *u.PlexToken != "" {
+		next.PlexToken = strings.TrimSpace(*u.PlexToken)
 	}
 	if u.TorBoxToken != nil && *u.TorBoxToken != "" {
 		next.TorBoxToken = strings.TrimSpace(*u.TorBoxToken)
@@ -194,13 +218,19 @@ func validateEditable(s EditableSettings) error {
 			return errors.New("Seerr URL must be an http or https URL")
 		}
 	}
+	if s.PlexURL != "" {
+		parsed, err := url.Parse(s.PlexURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return errors.New("Plex URL must be an http or https URL")
+		}
+	}
 	if s.MaxResults < 1 || s.MaxResults > 500 {
 		return errors.New("max results must be between 1 and 500")
 	}
 	if s.MinSeeders < 0 {
 		return errors.New("minimum seeders cannot be negative")
 	}
-	for label, value := range map[string]string{"poll interval": s.PollInterval, "resolve timeout": s.ResolveTimeout, "stream URL TTL": s.StreamURLTTL} {
+	for label, value := range map[string]string{"poll interval": s.PollInterval, "resolve timeout": s.ResolveTimeout, "stream URL TTL": s.StreamURLTTL, "Plex scan delay": s.PlexScanDelay} {
 		d, err := time.ParseDuration(value)
 		if err != nil || d <= 0 {
 			return fmt.Errorf("%s must be a positive duration", label)

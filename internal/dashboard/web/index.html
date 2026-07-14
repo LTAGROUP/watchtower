@@ -19,6 +19,7 @@
         <a href="#discover" data-route="discover"><span class="nav-icon">⌕</span>Discover</a>
         <a href="#library" data-route="library"><span class="nav-icon">▦</span>Library</a>
         <a href="#queue" data-route="queue"><span class="nav-icon">↻</span>Queue <b id="queue-badge">0</b></a>
+        <a href="#logs" data-route="logs"><span class="nav-icon">≡</span>Logs</a>
         <a href="#settings" data-route="settings"><span class="nav-icon">⚙</span>Settings</a>
       </nav>
       <div class="sidebar-foot">
@@ -105,6 +106,29 @@
         <div id="queue-list" class="queue-list"></div>
       </section>
 
+      <section class="page" id="logs-page">
+        <div class="section-intro">
+          <div><h2>Live service logs.</h2><p>Search and filter recent activity across the WatchTower pipeline without leaving the dashboard.</p></div>
+        </div>
+        <div class="log-toolbar">
+          <label class="search-field"><span>⌕</span><input id="log-search" type="search" placeholder="Search messages and fields…" autocomplete="off"></label>
+          <label><span>Level</span><select id="log-level"><option value="">All levels</option><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warning</option><option value="error">Error</option></select></label>
+          <label><span>Component</span><select id="log-component"><option value="">All components</option></select></label>
+          <label><span>Sort</span><select id="log-sort"><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="level">Severity</option></select></label>
+          <label class="log-auto"><span>Auto refresh</span><span class="log-auto-control"><input id="log-auto-refresh" type="checkbox" checked><i></i><span>Every 5s</span></span></label>
+          <button class="button ghost" id="log-refresh" type="button">Refresh</button>
+        </div>
+        <div class="results-head"><p id="log-count">Loading logs…</p><span class="muted" id="log-updated"></span></div>
+        <div class="table-card log-table-card">
+          <div class="table-scroll">
+            <table class="log-table">
+              <thead><tr><th>Time</th><th>Level</th><th>Component</th><th>Event</th></tr></thead>
+              <tbody id="log-body"><tr><td colspan="4" class="empty-state">Loading recent logs…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <section class="page" id="settings-page">
         <div class="section-intro"><div><h2>Runtime settings.</h2><p>Changes are saved in the data volume and take effect without rebuilding the container.</p></div></div>
         <form id="settings-form" class="settings-layout">
@@ -115,6 +139,14 @@
               <label class="wide"><span>API key</span><input name="seerrApiKey" type="password" placeholder="Leave blank to keep current key" autocomplete="new-password"></label>
               <label><span>Poll interval</span><input name="pollInterval" placeholder="2m"></label>
               <label><span>Scrape timeout</span><input name="resolveTimeout" placeholder="15m"></label>
+            </div>
+          </article>
+          <article class="panel settings-section">
+            <div class="panel-head"><div><p class="kicker">Connection</p><h3>Plex</h3></div><span id="plex-state" class="connection-pill">Checking</span></div>
+            <div class="field-grid">
+              <label class="wide"><span>Plex URL</span><input name="plexUrl" type="url" placeholder="http://plex:32400"></label>
+              <label class="wide"><span>Access token</span><input name="plexToken" type="password" placeholder="Leave blank to keep current token" autocomplete="new-password"></label>
+              <label><span>Scan delay</span><input name="plexScanDelay" placeholder="45s"></label>
             </div>
           </article>
           <article class="panel settings-section">

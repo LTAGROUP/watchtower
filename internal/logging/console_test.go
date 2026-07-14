@@ -35,3 +35,40 @@ func TestConsoleHandlerAddsAndSanitizesANSI(t *testing.T) {
 		t.Fatalf("expected newlines to be escaped: %q", got)
 	}
 }
+
+func TestBufferRetainsStructuredRecentEntries(t *testing.T) {
+	buffer := NewBuffer(2)
+	logger := slog.New(buffer.Handler(slog.LevelDebug)).With("component", "resolver")
+	logger.Debug("first", "title", "One")
+	logger.Info("second", "title", "Two")
+	logger.Warn("third", "error", "not ready")
+
+	entries := buffer.Entries()
+	if len(entries) != 2 {
+		t.Fatalf("expected two retained entries, got %d", len(entries))
+	}
+	if entries[0].Message != "second" || entries[1].Message != "third" {
+		t.Fatalf("unexpected retained entries: %#v", entries)
+	}
+	if entries[1].Level != "warn" || entries[1].Component != "resolver" || entries[1].Fields["error"] != `"not ready"` {
+		t.Fatalf("unexpected structured entry: %#v", entries[1])
+	}
+	if entries[0].ID >= entries[1].ID {
+		t.Fatalf("entry IDs are not increasing: %#v", entries)
+	}
+}
+
+func TestTeeHandlerHonorsEachHandlerLevel(t *testing.T) {
+	var console bytes.Buffer
+	buffer := NewBuffer(10)
+	logger := slog.New(NewTeeHandler(NewConsoleHandler(&console, false), buffer.Handler(slog.LevelDebug)))
+	logger.Debug("dashboard-only")
+	logger.Info("everywhere")
+
+	if strings.Contains(console.String(), "dashboard-only") || !strings.Contains(console.String(), "everywhere") {
+		t.Fatalf("unexpected console output: %q", console.String())
+	}
+	if entries := buffer.Entries(); len(entries) != 2 {
+		t.Fatalf("expected both records in dashboard buffer, got %#v", entries)
+	}
+}

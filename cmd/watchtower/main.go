@@ -22,7 +22,11 @@ import (
 )
 
 func main() {
-	log := slog.New(logging.NewConsoleHandler(os.Stdout, colorLogs()))
+	logs := logging.NewBuffer(2000)
+	log := slog.New(logging.NewTeeHandler(
+		logging.NewConsoleHandler(os.Stdout, colorLogs()),
+		logs.Handler(slog.LevelDebug),
+	))
 	cfg := config.Load()
 	settings, err := config.OpenManager(cfg)
 	if err != nil {
@@ -58,7 +62,8 @@ func main() {
 		}
 		return &scraper.Aggregator{Addons: addons, Client: apiClient, Log: log}, nil
 	}
-	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, Log: log}
+	plex := &service.Plex{Config: cfg, Settings: settings.Snapshot, Client: apiClient, Log: log}
+	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, LibraryChanged: plex.Notify, Log: log}
 	streamClient := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}, Timeout: 0}
 	streamer := &service.Streamer{Store: st, Settings: settings.Snapshot, ProviderFactory: providerFactory, Repair: resolver.Repair, Client: streamClient, TTL: cfg.StreamURLTTL, Log: log}
 	mux := http.NewServeMux()
@@ -83,7 +88,8 @@ func main() {
 	defer stop()
 	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Client: apiClient, Log: log}
 	go seerr.Run(ctx)
-	dashboardHandler := (&dashboard.Handler{Store: st, Settings: settings, Resolver: resolver, Seerr: seerr, Username: cfg.DashboardUsername, Password: cfg.DashboardPassword, Log: log}).Routes()
+	go plex.Run(ctx)
+	dashboardHandler := (&dashboard.Handler{Store: st, Settings: settings, Resolver: resolver, Seerr: seerr, Username: cfg.DashboardUsername, Password: cfg.DashboardPassword, Log: log, Logs: logs}).Routes()
 	dashboardServer := &http.Server{Addr: cfg.DashboardAddr, Handler: requestLog(log, dashboardHandler), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Info("listening", "address", cfg.ListenAddr)
@@ -118,7 +124,7 @@ func requestLog(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		if r.URL.Path != "/healthz" {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/api/v1/logs" {
 			log.Info("request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start).String())
 		}
 	})
