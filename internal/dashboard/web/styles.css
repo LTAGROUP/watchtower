@@ -177,7 +177,7 @@ td strong { color: var(--text); font-size: 11px; }
 .cell-sub { display: block; color: #707886; font-size: 9px; margin-top: 4px; max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row-action { border: 0; background: transparent; color: var(--accent); cursor: pointer; font-size: 10px; font-weight: 750; }
 .log-auto-control { height: 38px; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 9px; white-space: nowrap; }
-.log-auto-control input { position: absolute; opacity: 0; pointer-events: none; }
+.log-auto-control input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .log-auto-control i { width: 30px; height: 17px; flex: 0 0 auto; background: #333945; border-radius: 20px; position: relative; }
 .log-auto-control i::after { content: ""; position: absolute; width: 11px; height: 11px; left: 3px; top: 3px; border-radius: 50%; background: #8b929e; transition: .18s; }
 .log-auto-control input:checked + i { background: rgba(114,214,160,.25); }
@@ -298,8 +298,8 @@ dialog::backdrop { background: rgba(4,5,8,.75); backdrop-filter: blur(5px); }
   .app-shell { display: block; }
   .sidebar { position: fixed; top: auto; bottom: 0; left: 0; width: 100%; height: 66px; border: 0; border-top: 1px solid var(--line); padding: 7px 10px; display: block; }
   .brand, .sidebar-foot { display: none; }
-  .nav { display: grid; grid-template-columns: repeat(6, 1fr); gap: 2px; }
-  .nav a, .nav a.active { height: 50px; display: flex; flex-direction: column; gap: 2px; font-size: 8px; box-shadow: none; background: transparent; }
+  .nav { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 2px; }
+  .nav a, .nav a.active { min-width: 0; height: 50px; display: flex; flex-direction: column; gap: 2px; font-size: 8px; box-shadow: none; background: transparent; }
   .nav-icon { font-size: 18px; line-height: 18px; }
   .nav b { margin: -29px 0 0 24px; }
   main { padding: 0 15px 90px; }
