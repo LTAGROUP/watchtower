@@ -1,6 +1,6 @@
 const state = {
   route: 'dashboard', summary: null, media: [], files: [], queue: [], settings: null,
-  libraryTab: 'media', detailCache: new Map(),
+  libraryTab: 'media', detailCache: new Map(), detail: null,
   discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true },
   logs: { entries: [], capacity: 0, loading: false }
 };
@@ -95,13 +95,14 @@ function renderLibrary() {
     return;
   }
   $('#library-head').innerHTML = '<tr><th>File path</th><th>Quality</th><th>Provider</th><th>Size</th><th>Added</th></tr>';
-  const rows = [...state.files].filter(file => `${file.path} ${file.quality} ${file.provider}`.toLowerCase().includes(query));
+  const rows = [...state.files].sort(compareEpisodeFiles).filter(file => `${file.path} ${file.quality} ${file.provider}`.toLowerCase().includes(query));
   $('#library-body').innerHTML = rows.length ? rows.map(file => `<tr><td><strong>${escapeHTML(lastPath(file.path))}</strong><span class="cell-sub" title="${escapeHTML(file.path)}">${escapeHTML(file.path)}</span></td><td>${escapeHTML(file.quality)}</td><td>${escapeHTML(file.provider)}</td><td>${formatBytes(file.size)}</td><td>${timeAgo(file.createdAt)}</td></tr>`).join('') : emptyRow(5, 'No files match this filter.');
 }
 
 function libraryCard(item) {
   const poster = item.posterPath && /^\/[A-Za-z0-9._-]+$/.test(item.posterPath) ? `https://image.tmdb.org/t/p/w500${item.posterPath}` : `/api/v1/media/${item.id}/poster`;
-  return `<article class="poster-card" role="button" tabindex="0" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}"><div class="poster"><div class="poster-fallback">${escapeHTML(item.title)}</div><img src="${poster}" alt="" loading="lazy"><span class="poster-status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span><div class="poster-overlay"><button class="button ghost" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}">View details</button></div></div><div class="poster-copy"><strong title="${escapeHTML(item.title)}">${escapeHTML(item.title)}</strong><small><span>${item.year || '—'}</span><span>${item.type === 'tv' ? 'TV' : 'Movie'} · ${filesFor(item.id).length} files</span></small></div></article>`;
+  const inventory = item.type === 'tv' ? episodeProgress(item) : `${filesFor(item.id).length} files`;
+  return `<article class="poster-card" role="button" tabindex="0" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}"><div class="poster"><div class="poster-fallback">${escapeHTML(item.title)}</div><img src="${poster}" alt="" loading="lazy"><span class="poster-status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span><div class="poster-overlay"><button class="button ghost" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}">View details</button></div></div><div class="poster-copy"><strong title="${escapeHTML(item.title)}">${escapeHTML(item.title)}</strong><small><span>${item.year || '—'}</span><span>${item.type === 'tv' ? 'TV' : 'Movie'} · ${escapeHTML(inventory)}</span></small></div></article>`;
 }
 
 function renderQueue() {
@@ -224,6 +225,7 @@ async function loadDetails(type, id, fresh = false) {
 async function openMediaDetails(type, id) {
   const dialog = $('#media-dialog');
   dialog.dataset.type = type; dialog.dataset.id = id;
+  state.detail = null;
   $('#detail-title').textContent = 'Loading…';
   $('#detail-meta').textContent = '';
   $('#detail-overview').textContent = '';
@@ -261,13 +263,35 @@ function renderMediaDetails(data, type, id) {
   } else {
     $('#detail-actions').innerHTML = `<button class="button primary" data-request-id="${id}" data-request-type="${type}" data-request-title="${escapeHTML(title)}" data-request-year="${escapeHTML(year)}">Request media</button>`;
   }
-  const seasons = (d.seasons || []).filter(season => season.seasonNumber > 0);
+  state.detail = {data, type, id, season:null};
+  renderDetailSeasons();
+  renderDetailFiles();
+}
+
+function renderDetailSeasons() {
+  if (!state.detail) return;
+  const {data, type, season:selectedSeason} = state.detail;
+  const seasons = (data.details?.seasons || []).filter(season => season.seasonNumber > 0).sort((a,b) => a.seasonNumber - b.seasonNumber);
   $('#detail-seasons-section').hidden = type !== 'tv';
   $('#detail-season-count').textContent = `${seasons.length} season${seasons.length === 1 ? '' : 's'}`;
-  $('#detail-seasons').innerHTML = seasons.map(season => `<span class="detail-season">Season ${season.seasonNumber} · ${season.episodeCount || 0} episodes</span>`).join('') || '<span class="muted">Season information unavailable</span>';
-  const files = data.files || [];
-  $('#detail-file-count').textContent = `${files.length} file${files.length === 1 ? '' : 's'}`;
-  $('#detail-files').innerHTML = files.length ? files.map(file => `<article class="detail-file"><div><strong title="${escapeHTML(file.path)}">${escapeHTML(lastPath(file.path))}</strong><small>${escapeHTML(file.quality)} · ${escapeHTML(file.provider)} · ${formatBytes(file.size)}<br>${escapeHTML(file.path)}</small></div><span class="stream-pill">${escapeHTML(file.streamState || 'on demand')}</span></article>`).join('') : `<div class="empty-state">${data.inLibrary ? 'No files have been resolved yet.' : 'Request this title to create stream files.'}</div>`;
+  $('#detail-seasons').innerHTML = seasons.map(season => {
+    const number = Number(season.seasonNumber);
+    const owned = episodeKeys(data.files || [], number).size;
+    const total = Number(season.episodeCount || data.media?.episodeCounts?.[number] || 0);
+    const count = data.inLibrary ? (total > 0 ? `${owned} out of ${total} episodes` : `${owned} episode${owned === 1 ? '' : 's'} in library`) : `${total} episode${total === 1 ? '' : 's'}`;
+    const active = selectedSeason === number;
+    return `<button type="button" class="detail-season${active ? ' active' : ''}" data-detail-season="${number}" aria-pressed="${active}"><strong>Season ${number}</strong><small>${escapeHTML(count)}</small></button>`;
+  }).join('') || '<span class="muted">Season information unavailable</span>';
+}
+
+function renderDetailFiles() {
+  if (!state.detail) return;
+  const {data, season} = state.detail;
+  const allFiles = [...(data.files || [])].sort(compareEpisodeFiles);
+  const files = season == null ? allFiles : allFiles.filter(file => episodeRef(file.path)?.season === season);
+  $('#detail-file-count').textContent = `${files.length} file${files.length === 1 ? '' : 's'}${season == null ? '' : ` · Season ${season}`}`;
+  const empty = season == null ? (data.inLibrary ? 'No files have been resolved yet.' : 'Request this title to create stream files.') : `No files for Season ${season} have been resolved yet.`;
+  $('#detail-files').innerHTML = files.length ? files.map(file => `<article class="detail-file"><div><strong title="${escapeHTML(file.path)}">${escapeHTML(lastPath(file.path))}</strong><small>${escapeHTML(file.quality)} · ${escapeHTML(file.provider)} · ${formatBytes(file.size)}<br>${escapeHTML(file.path)}</small></div><span class="stream-pill">${escapeHTML(file.streamState || 'on demand')}</span></article>`).join('') : `<div class="empty-state">${escapeHTML(empty)}</div>`;
 }
 
 async function openRequest(button) {
@@ -385,6 +409,11 @@ function bindImageFallbacks(root) {
 }
 function isInLibrary(type, tmdbID) { return state.media.some(item => item.type === type && Number(item.tmdbId) === Number(tmdbID)); }
 function filesFor(mediaId) { return state.files.filter(file => Number(file.mediaId) === Number(mediaId)); }
+function episodeRef(path = '') { const match = String(path).match(/S(\d{1,2})E(\d{1,3})/i); return match ? {season:Number(match[1]), episode:Number(match[2])} : null; }
+function episodeKeys(files, season = null) { const keys = new Set(); files.forEach(file => { const ref = episodeRef(file.path); if (ref && (season == null || ref.season === Number(season))) keys.add(`${ref.season}:${ref.episode}`); }); return keys; }
+function episodeProgress(item) { const owned = episodeKeys(filesFor(item.id)).size; const counts = item.episodeCounts || {}; const selected = (item.seasons || []).map(Number); const total = (selected.length ? selected : Object.keys(counts).map(Number)).reduce((sum, season) => sum + Number(counts[season] || 0), 0); return total > 0 ? `${owned} of ${total} episodes` : `${owned} episode${owned === 1 ? '' : 's'}`; }
+function compareEpisodeFiles(a, b) { const group = mediaPathGroup(a.path).localeCompare(mediaPathGroup(b.path)); if (group) return group; const left = episodeRef(a.path); const right = episodeRef(b.path); if (left && right) return left.season - right.season || left.episode - right.episode || String(a.path).localeCompare(String(b.path)); if (left) return -1; if (right) return 1; return String(a.path).localeCompare(String(b.path)); }
+function mediaPathGroup(path = '') { const parts = String(path).split('/'); return parts.length > 2 ? parts.slice(0, 2).join('/') : parts.slice(0, -1).join('/'); }
 function lastPath(path = '') { return String(path).split('/').pop(); }
 function emptyRow(columns, message) { return `<tr><td colspan="${columns}" class="empty-state">${escapeHTML(message)}</td></tr>`; }
 function formatBytes(bytes = 0) { if (!bytes) return '0 B'; const units=['B','KB','MB','GB','TB']; const i=Math.min(Math.floor(Math.log(bytes)/Math.log(1024)),4); return `${(bytes/Math.pow(1024,i)).toFixed(i > 2 ? 1 : 0)} ${units[i]}`; }
@@ -426,6 +455,8 @@ document.addEventListener('click', event => {
   if (reset) { event.stopPropagation(); resetMedia(reset.dataset.resetId, reset); return; }
   const remove = event.target.closest('[data-delete-id]');
   if (remove) { event.stopPropagation(); deleteMedia(remove.dataset.deleteId, remove.dataset.deleteTitle, remove); return; }
+  const season = event.target.closest('[data-detail-season]');
+  if (season && state.detail) { const selected = Number(season.dataset.detailSeason); state.detail.season = state.detail.season === selected ? null : selected; renderDetailSeasons(); renderDetailFiles(); return; }
   const detail = event.target.closest('[data-detail-type][data-detail-id]');
   if (detail) openMediaDetails(detail.dataset.detailType, detail.dataset.detailId);
 });

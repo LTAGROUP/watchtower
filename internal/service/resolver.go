@@ -78,18 +78,24 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 	m.UpdatedAt = time.Now().UTC()
 	_ = r.Store.UpsertMedia(m)
 	var errs []string
-	total := 0
-	var resolvedFiles []*model.File
+	resolvedFilesBySlot := map[string]*model.File{}
 	resolvedSlots := map[string]bool{}
 	type job struct {
 		quality string
 		season  int
+		episode int
 	}
 	var jobs []job
 	for _, q := range cfg.Qualities {
 		if m.Type == "tv" && len(m.Seasons) > 0 {
 			for _, season := range m.Seasons {
-				jobs = append(jobs, job{quality: q, season: season})
+				episodes := m.EpisodeCounts[season]
+				if episodes <= 0 {
+					episodes = 1
+				}
+				for episode := 1; episode <= episodes; episode++ {
+					jobs = append(jobs, job{quality: q, season: season, episode: episode})
+				}
 			}
 		} else {
 			jobs = append(jobs, job{quality: q})
@@ -99,12 +105,16 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		q := work.quality
 		label := q
 		if m.Type == "tv" && work.season > 0 {
-			label = fmt.Sprintf("S%02d %s", work.season, q)
+			label = fmt.Sprintf("S%02dE%02d %s", work.season, work.episode, q)
+		}
+		targetSlot := resolutionSlot(m.Type, q, work.season, work.episode)
+		if resolvedSlots[targetSlot] {
+			continue
 		}
 		m.Status = "scraping"
 		m.UpdatedAt = time.Now().UTC()
 		_ = r.Store.UpsertMedia(m)
-		rels, err := searcher.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season}, cfg.MaxResults)
+		rels, err := searcher.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season, Episode: work.episode}, cfg.MaxResults)
 		if err != nil {
 			if r.Log != nil {
 				r.Log.Error("media scrape failed", "component", "resolver", "title", m.Title, "target", label, "error", err)
@@ -154,13 +164,23 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 					}
 					continue
 				}
-				resolvedFiles = append(resolvedFiles, files...)
-				resolvedSlots[resolutionSlot(m.Type, q, work.season)] = true
-				total += len(files)
-				if r.Log != nil {
-					r.Log.Info("provider resolution completed", "component", "resolver", "title", m.Title, "target", label, "provider", p.Name(), "source", rel.Source, "files_added", len(files), "cached", resolved.Cached, "duration", time.Since(attemptStarted).String())
+				if m.Type == "tv" && !filesContainSlot(m.Type, files, targetSlot) {
+					continue
 				}
-				found = true
+				added := 0
+				for _, file := range files {
+					slot := fileResolutionSlot(m.Type, file)
+					if resolvedSlots[slot] {
+						continue
+					}
+					resolvedFilesBySlot[slot] = file
+					resolvedSlots[slot] = true
+					added++
+				}
+				if r.Log != nil {
+					r.Log.Info("provider resolution completed", "component", "resolver", "title", m.Title, "target", label, "provider", p.Name(), "source", rel.Source, "files_added", added, "cached", resolved.Cached, "duration", time.Since(attemptStarted).String())
+				}
+				found = resolvedSlots[targetSlot]
 				break
 			}
 			if found {
@@ -171,6 +191,7 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 			errs = append(errs, label+": no acceptable cached release")
 		}
 	}
+	total := len(resolvedFilesBySlot)
 	if total == 0 {
 		m.Status = "failed"
 		m.Error = strings.Join(errs, "; ")
@@ -182,7 +203,11 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		m.Error = ""
 	}
 	if total > 0 {
-		finalFiles := append([]*model.File(nil), resolvedFiles...)
+		finalFiles := make([]*model.File, 0, total)
+		for _, file := range resolvedFilesBySlot {
+			finalFiles = append(finalFiles, file)
+		}
+		sort.Slice(finalFiles, func(i, j int) bool { return finalFiles[i].Path < finalFiles[j].Path })
 		for _, previous := range r.Store.FilesForMedia(m.ID) {
 			if !resolvedSlots[fileResolutionSlot(m.Type, previous)] {
 				finalFiles = append(finalFiles, previous)
@@ -217,22 +242,33 @@ func IsUnreleased(m *model.Media, now time.Time) bool {
 	return date != "" && date > now.UTC().Format("2006-01-02")
 }
 
-func resolutionSlot(kind, quality string, season int) string {
+func resolutionSlot(kind, quality string, season, episode int) string {
 	quality = strings.ToLower(strings.TrimSpace(quality))
 	if kind == "tv" {
-		return fmt.Sprintf("%s|%d", quality, season)
+		return fmt.Sprintf("%s|%d|%d", quality, season, episode)
 	}
 	return quality
 }
 
 func fileResolutionSlot(kind string, file *model.File) string {
 	season := 0
+	episode := 0
 	if kind == "tv" {
 		if match := episodeRE.FindStringSubmatch(file.Path); len(match) == 3 {
 			season, _ = strconv.Atoi(match[1])
+			episode, _ = strconv.Atoi(match[2])
 		}
 	}
-	return resolutionSlot(kind, file.Quality, season)
+	return resolutionSlot(kind, file.Quality, season, episode)
+}
+
+func filesContainSlot(kind string, files []*model.File, wanted string) bool {
+	for _, file := range files {
+		if fileResolutionSlot(kind, file) == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Resolver) Repair(ctx context.Context, stale *model.File) (*model.File, error) {
@@ -283,13 +319,15 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 		providers = r.ProviderFactory(cfg)
 	}
 	season := 0
+	episode := 0
 	if match := episodeRE.FindStringSubmatch(stale.Path); len(match) == 3 {
 		season, _ = strconv.Atoi(match[1])
+		episode, _ = strconv.Atoi(match[2])
 	}
 	if r.Log != nil {
 		r.Log.Warn("stale stream repair started", "component", "resolver", "title", media.Title, "file", stale.Path, "quality", stale.Quality, "provider", stale.Provider)
 	}
-	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: season}, cfg.MaxResults)
+	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: season, Episode: episode}, cfg.MaxResults)
 	if err != nil {
 		return nil, err
 	}

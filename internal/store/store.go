@@ -145,6 +145,7 @@ func (s *Store) MediaByID(id int64) (*model.Media, bool) {
 	}
 	copy := *m
 	copy.Seasons = append([]int(nil), m.Seasons...)
+	copy.EpisodeCounts = copyEpisodeCounts(m.EpisodeCounts)
 	return &copy, true
 }
 func (s *Store) FindMediaByTMDB(kind string, tmdbID int64) (*model.Media, bool) {
@@ -154,6 +155,7 @@ func (s *Store) FindMediaByTMDB(kind string, tmdbID int64) (*model.Media, bool) 
 		if m != nil && m.Type == kind && m.TMDBID == tmdbID {
 			copy := *m
 			copy.Seasons = append([]int(nil), m.Seasons...)
+			copy.EpisodeCounts = copyEpisodeCounts(m.EpisodeCounts)
 			return &copy, true
 		}
 	}
@@ -228,7 +230,19 @@ func (s *Store) ResetMedia(id int64) (*model.Media, error) {
 	}
 	copy := *m
 	copy.Seasons = append([]int(nil), m.Seasons...)
+	copy.EpisodeCounts = copyEpisodeCounts(m.EpisodeCounts)
 	return &copy, nil
+}
+
+func copyEpisodeCounts(counts map[int]int) map[int]int {
+	if len(counts) == 0 {
+		return nil
+	}
+	copy := make(map[int]int, len(counts))
+	for season, count := range counts {
+		copy[season] = count
+	}
+	return copy
 }
 
 func (s *Store) DeleteMedia(id int64) error {

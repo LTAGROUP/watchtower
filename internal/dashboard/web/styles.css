@@ -263,7 +263,14 @@ dialog::backdrop { background: rgba(4,5,8,.75); backdrop-filter: blur(5px); }
 .detail-section-head { display: flex; align-items: baseline; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
 .detail-section-head span { font-size: 9px; }
 .detail-seasons { display: flex; gap: 7px; flex-wrap: wrap; padding-top: 12px; }
-.detail-season { padding: 7px 10px; background: #1a1e26; border: 1px solid #292f39; border-radius: 8px; font-size: 9px; color: #b9c0ca; }
+.detail-season { min-width: 132px; padding: 8px 11px; background: #1a1e26; border: 1px solid #292f39; border-radius: 8px; color: #b9c0ca; font: inherit; text-align: left; cursor: pointer; transition: border-color .16s, background .16s, transform .16s; }
+.detail-season:hover { border-color: #4a5260; transform: translateY(-1px); }
+.detail-season:focus-visible { outline: 0; box-shadow: 0 0 0 3px rgba(255, 107, 53, .24); }
+.detail-season.active { border-color: rgba(255, 107, 53, .7); background: rgba(255, 107, 53, .1); }
+.detail-season strong, .detail-season small { display: block; }
+.detail-season strong { color: #dce0e6; font-size: 9px; }
+.detail-season small { margin-top: 4px; color: var(--muted); font-size: 8px; }
+.detail-season.active small { color: #ff9a73; }
 .detail-files { display: grid; gap: 7px; padding-top: 12px; }
 .detail-file { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 12px; align-items: center; padding: 12px 13px; border: 1px solid #292f39; border-radius: 9px; background: #171a21; }
 .detail-file strong { display: block; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

@@ -22,6 +22,7 @@ type Query struct {
 	ExternalID string
 	TMDBID     int64
 	Season     int
+	Episode    int
 }
 
 type Searcher interface {
@@ -84,7 +85,10 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 	}
 	if q.MediaType == "tv" {
 		mediaType = "series"
-		episode := 1
+		episode := q.Episode
+		if episode <= 0 {
+			episode = 1
+		}
 		if q.Season <= 0 {
 			q.Season = 1
 		}

@@ -177,7 +177,7 @@ func (h *Handler) createRequest(w http.ResponseWriter, r *http.Request) {
 		ID: directMediaID(input.MediaType, input.MediaID), Type: input.MediaType, TMDBID: input.MediaID,
 		ExternalID: externalID, Title: title, Year: year, Overview: details.Overview,
 		PosterPath: details.PosterPath, BackdropPath: details.BackdropPath,
-		Seasons: input.Seasons, ReleaseDate: h.Seerr.MediaReleaseDate(r.Context(), input.MediaType, input.MediaID, details, input.Seasons), Status: "queued", CreatedAt: now, UpdatedAt: now,
+		Seasons: input.Seasons, EpisodeCounts: service.CatalogEpisodeCounts(input.Seasons, details.Seasons), ReleaseDate: h.Seerr.MediaReleaseDate(r.Context(), input.MediaType, input.MediaID, details, input.Seasons), Status: "queued", CreatedAt: now, UpdatedAt: now,
 	}
 	if err := h.Store.UpsertMedia(item); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -206,6 +206,10 @@ func (h *Handler) catalogDetails(w http.ResponseWriter, r *http.Request) {
 	if inLibrary {
 		changed := media.Overview == "" || media.PosterPath == "" || media.BackdropPath == ""
 		media.Overview, media.PosterPath, media.BackdropPath = details.Overview, details.PosterPath, details.BackdropPath
+		if counts := service.CatalogEpisodeCounts(media.Seasons, details.Seasons); len(counts) > 0 {
+			media.EpisodeCounts = counts
+			changed = true
+		}
 		if changed {
 			_ = h.Store.UpsertMedia(media)
 		}
@@ -225,7 +229,7 @@ func catalogFromMedia(media *model.Media) service.CatalogDetails {
 			details.FirstAirDate = strconv.Itoa(media.Year) + "-01-01"
 		}
 		for _, season := range media.Seasons {
-			details.Seasons = append(details.Seasons, service.CatalogSeason{SeasonNumber: season, Name: fmt.Sprintf("Season %d", season)})
+			details.Seasons = append(details.Seasons, service.CatalogSeason{SeasonNumber: season, Name: fmt.Sprintf("Season %d", season), EpisodeCount: media.EpisodeCounts[season]})
 		}
 	} else {
 		details.Title = media.Title
@@ -280,6 +284,9 @@ func (h *Handler) resetMedia(w http.ResponseWriter, r *http.Request) {
 		if item.RequestID > 0 {
 			err = h.Seerr.Retry(context.Background(), item)
 		} else {
+			if h.Seerr != nil {
+				_ = h.Seerr.RefreshEpisodeCounts(context.Background(), item)
+			}
 			err = h.Resolver.Resolve(context.Background(), item)
 		}
 		if err != nil && h.Log != nil {

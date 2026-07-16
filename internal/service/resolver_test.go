@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -29,6 +31,26 @@ func (s fixedSearcher) Search(context.Context, scraper.Query, int) ([]model.Rele
 
 type fixedProvider struct {
 	resolved model.Resolved
+}
+
+type episodeSearcher struct {
+	queries []scraper.Query
+}
+
+func (s *episodeSearcher) Search(_ context.Context, query scraper.Query, _ int) ([]model.Release, error) {
+	s.queries = append(s.queries, query)
+	return []model.Release{{Title: fmt.Sprintf("Example.S%02dE%02d.1080p", query.Season, query.Episode), DownloadURL: strconv.Itoa(query.Episode), Seeders: 10}}, nil
+}
+
+type episodeProvider struct{}
+
+func (episodeProvider) Name() string { return "test" }
+func (episodeProvider) Resolve(_ context.Context, release model.Release) (model.Resolved, error) {
+	episode, _ := strconv.Atoi(release.DownloadURL)
+	return model.Resolved{ItemID: release.DownloadURL, Cached: true, Files: []model.RemoteFile{{ID: release.DownloadURL, Name: fmt.Sprintf("Example.S01E%02d.mkv", episode), Size: 100}}}, nil
+}
+func (episodeProvider) StreamURL(context.Context, *model.File) (string, error) {
+	return "", nil
 }
 
 func (p fixedProvider) Name() string { return "test" }
@@ -129,5 +151,72 @@ func TestResolverAtomicallyReplacesSuccessfulSlotsAndKeepsFailedSlots(t *testing
 	}
 	if libraryChanges != 1 {
 		t.Fatalf("expected one library change notification, got %d", libraryChanges)
+	}
+}
+
+func TestResolverSearchesEveryKnownEpisode(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 8, Type: "tv", Title: "Example", Year: 2025, Seasons: []int{1}, EpisodeCounts: map[int]int{1: 3}}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &episodeSearcher{}
+	resolver := &Resolver{
+		Config:    config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:     st,
+		Scraper:   searcher,
+		Providers: map[string]debrid.Provider{"test": episodeProvider{}},
+	}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if media.Status != "ready" {
+		t.Fatalf("expected ready result, got %s: %s", media.Status, media.Error)
+	}
+	if len(searcher.queries) != 3 {
+		t.Fatalf("expected one search per episode, got %#v", searcher.queries)
+	}
+	for i, query := range searcher.queries {
+		if query.Season != 1 || query.Episode != i+1 {
+			t.Fatalf("unexpected episode query %d: %#v", i, query)
+		}
+	}
+	files := st.FilesForMedia(media.ID)
+	if len(files) != 3 {
+		t.Fatalf("expected all three episode files, got %#v", files)
+	}
+}
+
+func TestResolverSeasonPackSatisfiesRemainingEpisodeJobs(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 9, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 3}}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &episodeSearcher{}
+	resolver := &Resolver{
+		Config:  config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:   st,
+		Scraper: searcher,
+		Providers: map[string]debrid.Provider{"test": fixedProvider{resolved: model.Resolved{ItemID: "season-pack", Cached: true, Files: []model.RemoteFile{
+			{ID: "1", Name: "Example.S01E01.mkv", Size: 100},
+			{ID: "2", Name: "Example.S01E02.mkv", Size: 100},
+			{ID: "3", Name: "Example.S01E03.mkv", Size: 100},
+		}}}},
+	}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if media.Status != "ready" || len(st.FilesForMedia(media.ID)) != 3 {
+		t.Fatalf("season pack did not resolve the full season: status=%s files=%#v", media.Status, st.FilesForMedia(media.ID))
+	}
+	if len(searcher.queries) != 1 || searcher.queries[0].Episode != 1 {
+		t.Fatalf("expected the season pack to skip later episode searches, got %#v", searcher.queries)
 	}
 }

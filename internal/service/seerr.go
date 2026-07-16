@@ -173,7 +173,7 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	if externalID == "" {
 		externalID = d.ExternalIDs.IMDBID
 	}
-	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Overview: d.Overview, PosterPath: d.PosterPath, BackdropPath: d.BackdropPath, Seasons: seasons, ReleaseDate: s.MediaReleaseDate(ctx, kind, x.Media.TMDBID, d, seasons), Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	m := &model.Media{ID: x.Media.ID, RequestID: x.ID, Type: kind, TMDBID: x.Media.TMDBID, ExternalID: externalID, Title: title, Year: year, Overview: d.Overview, PosterPath: d.PosterPath, BackdropPath: d.BackdropPath, Seasons: seasons, EpisodeCounts: CatalogEpisodeCounts(seasons, d.Seasons), ReleaseDate: s.MediaReleaseDate(ctx, kind, x.Media.TMDBID, d, seasons), Status: "queued", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	s.Log.Info("seerr media details obtained", "component", "seerr", "request", x.ID, "title", title, "type", kind, "imdb_id", externalID, "tmdb_id", x.Media.TMDBID, "seasons", seasons)
 	if e = s.Store.UpsertMedia(m); e == nil {
 		e = s.Resolver.Resolve(ctx, m)
@@ -385,6 +385,7 @@ func (s *Seerr) Retry(ctx context.Context, item *model.Media) error {
 		return fmt.Errorf("media is already being processed")
 	}
 	defer s.inflight.Delete(item.RequestID)
+	_ = s.RefreshEpisodeCounts(ctx, item)
 	if err := s.Resolver.Resolve(ctx, item); err != nil {
 		return err
 	}
@@ -420,6 +421,41 @@ func (s *Seerr) releaseDue(ctx context.Context) {
 			}
 		}(media.ID)
 	}
+}
+
+func (s *Seerr) RefreshEpisodeCounts(ctx context.Context, item *model.Media) error {
+	if item == nil || item.Type != "tv" || item.TMDBID <= 0 {
+		return nil
+	}
+	details, err := s.Catalog(ctx, item.Type, item.TMDBID)
+	if err != nil {
+		return err
+	}
+	counts := CatalogEpisodeCounts(item.Seasons, details.Seasons)
+	if len(counts) == 0 {
+		return nil
+	}
+	item.EpisodeCounts = counts
+	return s.Store.UpsertMedia(item)
+}
+
+func CatalogEpisodeCounts(seasons []int, available []CatalogSeason) map[int]int {
+	wanted := make(map[int]bool, len(seasons))
+	for _, season := range seasons {
+		if season > 0 {
+			wanted[season] = true
+		}
+	}
+	counts := make(map[int]int, len(wanted))
+	for _, season := range available {
+		if wanted[season.SeasonNumber] && season.EpisodeCount > 0 {
+			counts[season.SeasonNumber] = season.EpisodeCount
+		}
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	return counts
 }
 
 func (s *Seerr) seerrJSON(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {

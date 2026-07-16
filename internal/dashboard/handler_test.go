@@ -156,7 +156,7 @@ func TestCreateRequestQueuesDirectlyWithoutPostingToSeerr(t *testing.T) {
 		t.Fatalf("expected 202, got %d: %s", response.Code, response.Body.String())
 	}
 	media, ok := st.FindMediaByTMDB("tv", 99)
-	if !ok || media.Title != "Direct Show" || len(media.Seasons) != 2 || media.RequestID != 0 {
+	if !ok || media.Title != "Direct Show" || len(media.Seasons) != 2 || media.EpisodeCounts[1] != 8 || media.EpisodeCounts[2] != 6 || media.RequestID != 0 {
 		t.Fatalf("direct request was not persisted correctly: %#v", media)
 	}
 	deadline := time.Now().Add(time.Second)

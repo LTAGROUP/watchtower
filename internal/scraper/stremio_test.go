@@ -46,14 +46,14 @@ func TestAggregatorSearchesAndDeduplicatesAddons(t *testing.T) {
 
 func TestAggregatorUsesSeriesVideoID(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/stream/series/tt0944947:3:1.json" {
+		if r.URL.Path != "/stream/series/tt0944947:3:7.json" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		_, _ = w.Write([]byte(`{"streams":[]}`))
 	}))
 	defer server.Close()
 	a := &Aggregator{Addons: []Addon{{Name: "test", BaseURL: server.URL}}, Client: server.Client()}
-	if _, err := a.Search(context.Background(), Query{MediaType: "tv", ExternalID: "tt0944947", Season: 3}, 10); err != nil {
+	if _, err := a.Search(context.Background(), Query{MediaType: "tv", ExternalID: "tt0944947", Season: 3, Episode: 7}, 10); err != nil {
 		t.Fatal(err)
 	}
 }
