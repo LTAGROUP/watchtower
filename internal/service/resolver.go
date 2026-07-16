@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -80,6 +81,11 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 	var errs []string
 	resolvedFilesBySlot := map[string]*model.File{}
 	resolvedSlots := map[string]bool{}
+	existingFiles := r.Store.FilesForMedia(m.ID)
+	completedSlots := make(map[string]bool, len(existingFiles))
+	for _, file := range existingFiles {
+		completedSlots[fileResolutionSlot(m.Type, file)] = true
+	}
 	type job struct {
 		quality string
 		season  int
@@ -101,6 +107,7 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 			jobs = append(jobs, job{quality: q})
 		}
 	}
+jobLoop:
 	for _, work := range jobs {
 		q := work.quality
 		label := q
@@ -108,7 +115,7 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 			label = fmt.Sprintf("S%02dE%02d %s", work.season, work.episode, q)
 		}
 		targetSlot := resolutionSlot(m.Type, q, work.season, work.episode)
-		if resolvedSlots[targetSlot] {
+		if completedSlots[targetSlot] {
 			continue
 		}
 		m.Status = "scraping"
@@ -120,6 +127,9 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 				r.Log.Error("media scrape failed", "component", "resolver", "title", m.Title, "target", label, "error", err)
 			}
 			errs = append(errs, label+": "+err.Error())
+			if errors.Is(err, scraper.ErrRateLimited) {
+				break jobLoop
+			}
 			continue
 		}
 		m.ScrapedAt = time.Now().UTC()
@@ -170,17 +180,18 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 				added := 0
 				for _, file := range files {
 					slot := fileResolutionSlot(m.Type, file)
-					if resolvedSlots[slot] {
+					if completedSlots[slot] {
 						continue
 					}
 					resolvedFilesBySlot[slot] = file
 					resolvedSlots[slot] = true
+					completedSlots[slot] = true
 					added++
 				}
 				if r.Log != nil {
 					r.Log.Info("provider resolution completed", "component", "resolver", "title", m.Title, "target", label, "provider", p.Name(), "source", rel.Source, "files_added", added, "cached", resolved.Cached, "duration", time.Since(attemptStarted).String())
 				}
-				found = resolvedSlots[targetSlot]
+				found = completedSlots[targetSlot]
 				break
 			}
 			if found {
@@ -192,15 +203,21 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 		}
 	}
 	total := len(resolvedFilesBySlot)
-	if total == 0 {
-		m.Status = "failed"
-		m.Error = strings.Join(errs, "; ")
-	} else if len(errs) > 0 {
-		m.Status = "partial"
-		m.Error = strings.Join(errs, "; ")
-	} else {
+	completed := 0
+	for _, work := range jobs {
+		if completedSlots[resolutionSlot(m.Type, work.quality, work.season, work.episode)] {
+			completed++
+		}
+	}
+	if len(jobs) > 0 && completed == len(jobs) {
 		m.Status = "ready"
 		m.Error = ""
+	} else if completed == 0 {
+		m.Status = "failed"
+		m.Error = strings.Join(errs, "; ")
+	} else {
+		m.Status = "partial"
+		m.Error = strings.Join(errs, "; ")
 	}
 	if total > 0 {
 		finalFiles := make([]*model.File, 0, total)
@@ -208,7 +225,7 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 			finalFiles = append(finalFiles, file)
 		}
 		sort.Slice(finalFiles, func(i, j int) bool { return finalFiles[i].Path < finalFiles[j].Path })
-		for _, previous := range r.Store.FilesForMedia(m.ID) {
+		for _, previous := range existingFiles {
 			if !resolvedSlots[fileResolutionSlot(m.Type, previous)] {
 				finalFiles = append(finalFiles, previous)
 			}

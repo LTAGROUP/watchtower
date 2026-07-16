@@ -259,7 +259,7 @@ function renderMediaDetails(data, type, id) {
   const backdrop = d.backdropPath || data.media?.backdropPath;
   if (backdrop) $('#detail-backdrop').src = `https://image.tmdb.org/t/p/w1280${backdrop}`; else $('#detail-backdrop').removeAttribute('src');
   if (data.inLibrary) {
-    $('#detail-actions').innerHTML = `<button class="button ghost" data-reset-id="${data.media.id}">Reset & retry</button><button class="button danger" data-delete-id="${data.media.id}" data-delete-title="${escapeHTML(title)}">Delete from library</button>`;
+    $('#detail-actions').innerHTML = `<button class="button ghost" data-reset-id="${data.media.id}">Retry missing files</button><button class="button danger" data-delete-id="${data.media.id}" data-delete-title="${escapeHTML(title)}">Delete from library</button>`;
   } else {
     $('#detail-actions').innerHTML = `<button class="button primary" data-request-id="${id}" data-request-type="${type}" data-request-title="${escapeHTML(title)}" data-request-year="${escapeHTML(year)}">Request media</button>`;
   }
@@ -339,7 +339,7 @@ async function resetMedia(id, button) {
   try {
     await api(`/api/v1/media/${id}/reset`, {method:'POST'});
     state.detailCache.clear();
-    showNotice('Media reset. A fresh scrape has started.');
+    showNotice('Missing-file retry started. Existing files will be kept.');
     setTimeout(() => refreshAll(true), 700);
     $('#media-dialog').close();
   } catch (error) { showNotice(error.message, true); if (button) button.disabled = false; }

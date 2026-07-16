@@ -2,6 +2,7 @@ package scraper
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -55,5 +56,46 @@ func TestAggregatorUsesSeriesVideoID(t *testing.T) {
 	a := &Aggregator{Addons: []Addon{{Name: "test", BaseURL: server.URL}}, Client: server.Client()}
 	if _, err := a.Search(context.Background(), Query{MediaType: "tv", ExternalID: "tt0944947", Season: 3, Episode: 7}, 10); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAggregatorRetriesRateLimitOnce(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef01234567"
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"streams":[{"name":"Comet","title":"Example.1080p","infoHash":"` + hash + `"}]}`))
+	}))
+	defer server.Close()
+	aggregator := &Aggregator{Addons: []Addon{{Name: "test", BaseURL: server.URL}}, Client: server.Client()}
+	rows, err := aggregator.Search(context.Background(), Query{MediaType: "movie", ExternalID: "tt123"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(rows) != 1 {
+		t.Fatalf("expected one bounded retry and a successful result, calls=%d rows=%#v", calls, rows)
+	}
+}
+
+func TestAggregatorReturnsRateLimitAfterBoundedRetry(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Retry-After", "0")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	aggregator := &Aggregator{Addons: []Addon{{Name: "torrentio", BaseURL: server.URL}}, Client: server.Client()}
+	_, err := aggregator.Search(context.Background(), Query{MediaType: "movie", ExternalID: "tt123"}, 10)
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected a rate limit error, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected exactly one retry, got %d calls", calls)
 	}
 }

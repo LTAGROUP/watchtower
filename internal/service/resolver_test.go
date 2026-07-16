@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,8 +16,10 @@ import (
 	"github.com/LTAGROUP/watchtower/internal/store"
 )
 
-type fixedSearcher struct {
+type recordingSearcher struct {
+	queries  []scraper.Query
 	releases []model.Release
+	err      error
 }
 
 type panicSearcher struct{}
@@ -25,8 +28,9 @@ func (panicSearcher) Search(context.Context, scraper.Query, int) ([]model.Releas
 	panic("unreleased media must not be scraped")
 }
 
-func (s fixedSearcher) Search(context.Context, scraper.Query, int) ([]model.Release, error) {
-	return append([]model.Release(nil), s.releases...), nil
+func (s *recordingSearcher) Search(_ context.Context, query scraper.Query, _ int) ([]model.Release, error) {
+	s.queries = append(s.queries, query)
+	return append([]model.Release(nil), s.releases...), s.err
 }
 
 type fixedProvider struct {
@@ -109,7 +113,7 @@ func TestResolverDefersUnreleasedMediaWithoutScraping(t *testing.T) {
 	}
 }
 
-func TestResolverAtomicallyReplacesSuccessfulSlotsAndKeepsFailedSlots(t *testing.T) {
+func TestResolverSkipsExistingSlotsAndFillsOnlyMissingOnes(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -119,35 +123,35 @@ func TestResolverAtomicallyReplacesSuccessfulSlotsAndKeepsFailedSlots(t *testing
 		t.Fatal(err)
 	}
 	old2160 := &model.File{ID: "old-2160", MediaID: 7, Path: "Movies/Example/Example [2160p].mkv", Quality: "2160p"}
-	old1080 := &model.File{ID: "old-1080", MediaID: 7, Path: "Movies/Example/Example [1080p].mkv", Quality: "1080p"}
-	if err := st.AddFiles(old2160, old1080); err != nil {
+	if err := st.AddFiles(old2160); err != nil {
 		t.Fatal(err)
 	}
 	libraryChanges := 0
+	searcher := &recordingSearcher{releases: []model.Release{{Title: "Example 1080p", DownloadURL: "magnet:new", Seeders: 10}}}
 	resolver := &Resolver{
 		Config:  config.Config{Qualities: []string{"2160p", "1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
 		Store:   st,
-		Scraper: fixedSearcher{releases: []model.Release{{Title: "Example 2160p", DownloadURL: "magnet:new", Seeders: 10}}},
+		Scraper: searcher,
 		Providers: map[string]debrid.Provider{
-			"test": fixedProvider{resolved: model.Resolved{ItemID: "new-item", Cached: true, Files: []model.RemoteFile{{ID: "new-file", Name: "Example.2160p.mkv", Size: 100}}}},
+			"test": fixedProvider{resolved: model.Resolved{ItemID: "new-item", Cached: true, Files: []model.RemoteFile{{ID: "new-file", Name: "Example.1080p.mkv", Size: 100}}}},
 		},
 		LibraryChanged: func() { libraryChanges++ },
 	}
 	if err := resolver.Resolve(context.Background(), media); err != nil {
 		t.Fatal(err)
 	}
-	if media.Status != "partial" {
-		t.Fatalf("expected partial result, got %s", media.Status)
+	if media.Status != "ready" {
+		t.Fatalf("expected ready result, got %s: %s", media.Status, media.Error)
 	}
-	if _, ok := st.File(old2160.ID); ok {
-		t.Fatal("successfully resolved 2160p slot retained its old file")
+	if len(searcher.queries) != 1 {
+		t.Fatalf("expected only the missing 1080p slot to be searched, got %#v", searcher.queries)
 	}
-	if _, ok := st.File(old1080.ID); !ok {
-		t.Fatal("failed 1080p slot lost its previously working file")
+	if _, ok := st.File(old2160.ID); !ok {
+		t.Fatal("existing 2160p file was replaced during incremental retry")
 	}
 	files := st.FilesForMedia(media.ID)
 	if len(files) != 2 {
-		t.Fatalf("expected one replacement and one retained file, got %#v", files)
+		t.Fatalf("expected one existing and one newly resolved file, got %#v", files)
 	}
 	if libraryChanges != 1 {
 		t.Fatalf("expected one library change notification, got %d", libraryChanges)
@@ -187,6 +191,68 @@ func TestResolverSearchesEveryKnownEpisode(t *testing.T) {
 	files := st.FilesForMedia(media.ID)
 	if len(files) != 3 {
 		t.Fatalf("expected all three episode files, got %#v", files)
+	}
+}
+
+func TestResolverRetrySearchesOnlyMissingEpisodes(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 10, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 3}}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddFiles(
+		&model.File{ID: "e1", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E01 [1080p].mkv", Quality: "1080p"},
+		&model.File{ID: "e2", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E02 [1080p].mkv", Quality: "1080p"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &episodeSearcher{}
+	resolver := &Resolver{
+		Config:    config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:     st,
+		Scraper:   searcher,
+		Providers: map[string]debrid.Provider{"test": episodeProvider{}},
+	}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if media.Status != "ready" || len(st.FilesForMedia(media.ID)) != 3 {
+		t.Fatalf("incremental retry did not complete the season: status=%s files=%#v", media.Status, st.FilesForMedia(media.ID))
+	}
+	if len(searcher.queries) != 1 || searcher.queries[0].Episode != 3 {
+		t.Fatalf("expected only episode 3 to be searched, got %#v", searcher.queries)
+	}
+}
+
+func TestResolverStopsRemainingJobsAfterRateLimit(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 12, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 3}}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddFiles(&model.File{ID: "e1", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E01 [1080p].mkv", Quality: "1080p"}); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &recordingSearcher{err: fmt.Errorf("%w: torrentio", scraper.ErrRateLimited)}
+	resolver := &Resolver{
+		Config:  config.Config{Qualities: []string{"1080p"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:   st,
+		Scraper: searcher,
+	}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if media.Status != "partial" || !strings.Contains(media.Error, "S01E02") || strings.Contains(media.Error, "S01E03") {
+		t.Fatalf("unexpected rate-limited result: status=%s error=%q", media.Status, media.Error)
+	}
+	if len(searcher.queries) != 1 || searcher.queries[0].Episode != 2 {
+		t.Fatalf("expected rate limiting to stop after the first missing episode, got %#v", searcher.queries)
 	}
 }
 

@@ -3,6 +3,7 @@ package scraper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/model"
 )
@@ -31,9 +33,10 @@ type Searcher interface {
 
 type Addon struct{ Name, BaseURL string }
 type Aggregator struct {
-	Addons []Addon
-	Client *http.Client
-	Log    *slog.Logger
+	Addons              []Addon
+	Client              *http.Client
+	Log                 *slog.Logger
+	RateLimitRetryDelay time.Duration
 }
 
 type streamResponse struct {
@@ -50,6 +53,7 @@ type stream struct {
 
 var sizeRE = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)\s*(gib|gb|mib|mb)`)
 var seedRE = regexp.MustCompile(`(?i)(?:👤\s*|seeders?\D*|seeds?\D*)([0-9]+)`)
+var ErrRateLimited = errors.New("scraper rate limited")
 
 func ParseAddons(values []string) ([]Addon, error) {
 	out := make([]Addon, 0, len(values))
@@ -117,8 +121,12 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 	close(ch)
 	byHash := map[string]model.Release{}
 	var errs []string
+	rateLimited := false
 	for result := range ch {
 		if result.err != nil {
+			if errors.Is(result.err, ErrRateLimited) {
+				rateLimited = true
+			}
 			if a.Log != nil {
 				a.Log.Warn("scraper search failed", "component", "scraper", "addon", result.addon, "media_type", mediaType, "media_id", id, "error", result.err)
 			}
@@ -147,27 +155,50 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 		a.Log.Info("scraper aggregation completed", "component", "scraper", "media_type", mediaType, "media_id", id, "unique_streams", len(byHash), "returned_streams", len(out), "addons", len(a.Addons))
 	}
 	if len(out) == 0 && len(errs) > 0 {
-		return nil, fmt.Errorf("scrapers failed: %s", strings.Join(errs, "; "))
+		message := "scrapers failed: " + strings.Join(errs, "; ")
+		if rateLimited {
+			return nil, fmt.Errorf("%w: %s", ErrRateLimited, message)
+		}
+		return nil, errors.New(message)
 	}
 	return out, nil
 }
 
 func (a *Aggregator) searchAddon(ctx context.Context, addon Addon, mediaType, id string) ([]model.Release, error) {
 	u := addon.BaseURL + "/stream/" + url.PathEscape(mediaType) + "/" + url.PathEscape(id) + ".json"
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "WatchTower/1.0")
-	resp, err := a.Client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", addon.Name, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("%s: %s", addon.Name, resp.Status)
-	}
 	var payload streamResponse
-	if err = json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("%s: %w", addon.Name, err)
+	for attempt := 0; attempt < 2; attempt++ {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "WatchTower/1.0")
+		resp, err := a.Client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", addon.Name, err)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			delay := a.rateLimitDelay(resp.Header.Get("Retry-After"))
+			resp.Body.Close()
+			if attempt == 0 {
+				if a.Log != nil {
+					a.Log.Warn("scraper rate limited; retrying", "component", "scraper", "addon", addon.Name, "retry_after", delay.String())
+				}
+				if err := waitForRetry(ctx, delay); err != nil {
+					return nil, fmt.Errorf("%s: %w", addon.Name, err)
+				}
+				continue
+			}
+			return nil, fmt.Errorf("%s: %w (%s)", addon.Name, ErrRateLimited, resp.Status)
+		}
+		if resp.StatusCode/100 != 2 {
+			resp.Body.Close()
+			return nil, fmt.Errorf("%s: %s", addon.Name, resp.Status)
+		}
+		err = json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&payload)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", addon.Name, err)
+		}
+		break
 	}
 	out := make([]model.Release, 0, len(payload.Streams))
 	for _, s := range payload.Streams {
@@ -191,6 +222,36 @@ func (a *Aggregator) searchAddon(ctx context.Context, addon Addon, mediaType, id
 		out = append(out, model.Release{Title: title, DownloadURL: magnet, InfoHash: hash, Source: addon.Name, Size: size, Seeders: seeders})
 	}
 	return out, nil
+}
+
+func (a *Aggregator) rateLimitDelay(value string) time.Duration {
+	delay := a.RateLimitRetryDelay
+	if delay <= 0 {
+		delay = 2 * time.Second
+	}
+	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds >= 0 {
+		delay = time.Duration(seconds) * time.Second
+	} else if retryAt, err := http.ParseTime(value); err == nil {
+		delay = time.Until(retryAt)
+	}
+	if delay < 0 {
+		return 0
+	}
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func magnetURL(hash string, sources []string) string {
