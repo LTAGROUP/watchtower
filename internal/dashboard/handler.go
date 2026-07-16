@@ -54,6 +54,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/requests", h.createRequest)
 	mux.HandleFunc("GET /api/v1/media/{id}/poster", h.mediaPoster)
 	mux.HandleFunc("POST /api/v1/media/{id}/reset", h.resetMedia)
+	mux.HandleFunc("POST /api/v1/media/{id}/rerequest", h.rerequestMedia)
 	mux.HandleFunc("DELETE /api/v1/media/{id}", h.deleteMedia)
 	root, _ := fs.Sub(webFiles, "web")
 	files := http.FileServer(http.FS(root))
@@ -296,6 +297,58 @@ func (h *Handler) resetMedia(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"media": item})
 }
 
+type rerequestInput struct {
+	Season  int `json:"season"`
+	Episode int `json:"episode,omitempty"`
+}
+
+func (h *Handler) rerequestMedia(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("invalid media id"))
+		return
+	}
+	var input rerequestInput
+	if err := decodeJSON(w, r, &input); err != nil {
+		return
+	}
+	item, ok := h.Store.MediaByID(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("media item not found"))
+		return
+	}
+	if item.Type != "tv" || input.Season <= 0 || input.Episode < 0 || !containsInt(item.Seasons, input.Season) {
+		writeError(w, http.StatusBadRequest, errors.New("choose a tracked TV season and optional episode"))
+		return
+	}
+	if count := item.EpisodeCounts[input.Season]; input.Episode > 0 && count > 0 && input.Episode > count {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("episode %d is outside season %d", input.Episode, input.Season))
+		return
+	}
+	if item.Status == "queued" || item.Status == "scraping" || item.Status == "resolving" {
+		writeError(w, http.StatusConflict, errors.New("wait for active resolution to finish before re-requesting"))
+		return
+	}
+	if h.Resolver == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("media resolver is unavailable"))
+		return
+	}
+	item.Status = "queued"
+	item.Error = ""
+	item.ScrapedAt = time.Time{}
+	item.UpdatedAt = time.Now().UTC()
+	if err := h.Store.UpsertMedia(item); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"media": item, "season": input.Season, "episode": input.Episode})
+	go func() {
+		if err := h.Resolver.Rerequest(context.Background(), item, input.Season, input.Episode); err != nil && h.Log != nil {
+			h.Log.Error("dashboard re-request failed", "media", item.ID, "season", input.Season, "episode", input.Episode, "error", err)
+		}
+	}()
+}
+
 func (h *Handler) deleteMedia(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -383,6 +436,15 @@ func yearFromDate(value string) int {
 	}
 	year, _ := strconv.Atoi(value[:4])
 	return year
+}
+
+func containsInt(values []int, wanted int) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) basicAuth(next http.Handler) http.Handler {

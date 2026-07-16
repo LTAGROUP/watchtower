@@ -23,6 +23,9 @@ import (
 )
 
 var episodeRE = regexp.MustCompile(`(?i)S(\d{1,2})E(\d{1,3})`)
+var seasonOnlyRE = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])S(\d{1,2})(?:[^a-z0-9]|$)`)
+var seasonWordRE = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])Season[ ._-]*0*(\d{1,2})(?:[^a-z0-9]|$)`)
+var episodeRangeRE = regexp.MustCompile(`(?i)S(\d{1,2})E\d{1,3}[ ._-]*(?:-|to)[ ._-]*(?:S\d{1,2})?E?\d{1,3}`)
 var videoExt = map[string]bool{".mkv": true, ".mp4": true, ".avi": true, ".m4v": true, ".ts": true, ".mov": true}
 
 type Resolver struct {
@@ -46,6 +49,22 @@ type repairCall struct {
 }
 
 func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
+	return r.resolve(ctx, m, 0, 0, false)
+}
+
+// Rerequest resolves a TV season or a single episode even when matching files
+// already exist. Existing files are retained unless a replacement is found.
+func (r *Resolver) Rerequest(ctx context.Context, m *model.Media, season, episode int) error {
+	if m.Type != "tv" || season <= 0 || episode < 0 || !containsInt(m.Seasons, season) {
+		return fmt.Errorf("re-request requires a TV season and optional episode")
+	}
+	if count := m.EpisodeCounts[season]; episode > 0 && count > 0 && episode > count {
+		return fmt.Errorf("episode %d is outside season %d", episode, season)
+	}
+	return r.resolve(ctx, m, season, episode, true)
+}
+
+func (r *Resolver) resolve(ctx context.Context, m *model.Media, selectedSeason, selectedEpisode int, replaceExisting bool) error {
 	if IsUnreleased(m, time.Now()) {
 		m.Status = "unreleased"
 		m.Error = ""
@@ -94,17 +113,41 @@ func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 	var jobs []job
 	for _, q := range cfg.Qualities {
 		if m.Type == "tv" && len(m.Seasons) > 0 {
-			for _, season := range m.Seasons {
+			seasons := m.Seasons
+			if selectedSeason > 0 {
+				seasons = []int{selectedSeason}
+			}
+			for _, season := range seasons {
 				episodes := m.EpisodeCounts[season]
 				if episodes <= 0 {
 					episodes = 1
 				}
-				for episode := 1; episode <= episodes; episode++ {
+				firstEpisode := 1
+				if selectedEpisode > 0 {
+					firstEpisode, episodes = selectedEpisode, selectedEpisode
+				}
+				for episode := firstEpisode; episode <= episodes; episode++ {
 					jobs = append(jobs, job{quality: q, season: season, episode: episode})
 				}
 			}
 		} else {
 			jobs = append(jobs, job{quality: q})
+		}
+	}
+	wantedSlots := make(map[string]bool, len(jobs))
+	for _, work := range jobs {
+		slot := resolutionSlot(m.Type, work.quality, work.season, work.episode)
+		wantedSlots[slot] = true
+		if replaceExisting && selectedEpisode > 0 {
+			delete(completedSlots, slot)
+		}
+	}
+	if replaceExisting && selectedEpisode == 0 {
+		for _, file := range existingFiles {
+			season, _ := fileEpisode(file)
+			if season == selectedSeason {
+				delete(completedSlots, fileResolutionSlot(m.Type, file))
+			}
 		}
 	}
 jobLoop:
@@ -121,7 +164,13 @@ jobLoop:
 		m.Status = "scraping"
 		m.UpdatedAt = time.Now().UTC()
 		_ = r.Store.UpsertMedia(m)
-		rels, err := searcher.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season, Episode: work.episode}, cfg.MaxResults)
+		searchLimit := cfg.MaxResults
+		if m.Type == "tv" {
+			// Fetch all TV candidates so a lower-seeded season pack is not
+			// discarded before pack-aware ranking is applied below.
+			searchLimit = 0
+		}
+		rels, err := searcher.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season, Episode: work.episode}, searchLimit)
 		if err != nil {
 			if r.Log != nil {
 				r.Log.Error("media scrape failed", "component", "resolver", "title", m.Title, "target", label, "error", err)
@@ -139,12 +188,19 @@ jobLoop:
 		if r.Log != nil {
 			r.Log.Info("media scrape completed", "component", "resolver", "title", m.Title, "target", label, "streams", len(rels))
 		}
-		sort.SliceStable(rels, func(i, j int) bool { return releaseScore(rels[i], q) > releaseScore(rels[j], q) })
+		candidates := rels[:0]
+		for _, rel := range rels {
+			if (rel.Seeders < 0 || rel.Seeders >= cfg.MinSeeders) && matchesQuality(rel.Title, q) {
+				candidates = append(candidates, rel)
+			}
+		}
+		rels = candidates
+		sort.SliceStable(rels, func(i, j int) bool { return releasePreferred(rels[i], rels[j], q, work.season) })
+		if cfg.MaxResults > 0 && len(rels) > cfg.MaxResults {
+			rels = rels[:cfg.MaxResults]
+		}
 		found := false
 		for _, rel := range rels {
-			if (rel.Seeders >= 0 && rel.Seeders < cfg.MinSeeders) || !matchesQuality(rel.Title, q) {
-				continue
-			}
 			for _, name := range cfg.Providers {
 				p := providers[name]
 				if p == nil {
@@ -180,7 +236,7 @@ jobLoop:
 				added := 0
 				for _, file := range files {
 					slot := fileResolutionSlot(m.Type, file)
-					if completedSlots[slot] {
+					if (selectedEpisode > 0 && !wantedSlots[slot]) || completedSlots[slot] {
 						continue
 					}
 					resolvedFilesBySlot[slot] = file
@@ -271,12 +327,22 @@ func fileResolutionSlot(kind string, file *model.File) string {
 	season := 0
 	episode := 0
 	if kind == "tv" {
-		if match := episodeRE.FindStringSubmatch(file.Path); len(match) == 3 {
-			season, _ = strconv.Atoi(match[1])
-			episode, _ = strconv.Atoi(match[2])
-		}
+		season, episode = fileEpisode(file)
 	}
 	return resolutionSlot(kind, file.Quality, season, episode)
+}
+
+func fileEpisode(file *model.File) (int, int) {
+	if file == nil {
+		return 0, 0
+	}
+	match := episodeRE.FindStringSubmatch(file.Path)
+	if len(match) != 3 {
+		return 0, 0
+	}
+	season, _ := strconv.Atoi(match[1])
+	episode, _ := strconv.Atoi(match[2])
+	return season, episode
 }
 
 func filesContainSlot(kind string, files []*model.File, wanted string) bool {
@@ -344,21 +410,32 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 	if r.Log != nil {
 		r.Log.Warn("stale stream repair started", "component", "resolver", "title", media.Title, "file", stale.Path, "quality", stale.Quality, "provider", stale.Provider)
 	}
-	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: season, Episode: episode}, cfg.MaxResults)
+	searchLimit := cfg.MaxResults
+	if media.Type == "tv" {
+		searchLimit = 0
+	}
+	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: season, Episode: episode}, searchLimit)
 	if err != nil {
 		return nil, err
 	}
+	candidates := releases[:0]
+	for _, release := range releases {
+		if (release.Seeders < 0 || release.Seeders >= cfg.MinSeeders) && matchesQuality(release.Title, stale.Quality) {
+			candidates = append(candidates, release)
+		}
+	}
+	releases = candidates
 	sort.SliceStable(releases, func(i, j int) bool {
-		return releaseScore(releases[i], stale.Quality) > releaseScore(releases[j], stale.Quality)
+		return releasePreferred(releases[i], releases[j], stale.Quality, season)
 	})
+	if cfg.MaxResults > 0 && len(releases) > cfg.MaxResults {
+		releases = releases[:cfg.MaxResults]
+	}
 	providerOrder := append([]string(nil), cfg.Providers...)
 	if stale.Provider != "" {
 		providerOrder = moveFirst(providerOrder, stale.Provider)
 	}
 	for _, release := range releases {
-		if (release.Seeders >= 0 && release.Seeders < cfg.MinSeeders) || !matchesQuality(release.Title, stale.Quality) {
-			continue
-		}
 		for _, name := range providerOrder {
 			provider := providers[name]
 			if provider == nil {
@@ -427,6 +504,43 @@ func releaseScore(x model.Release, q string) int64 {
 	}
 	return s + x.Size/(1<<30)
 }
+
+func releasePreferred(a, b model.Release, quality string, season int) bool {
+	aQuality := matchesQuality(a.Title, quality)
+	bQuality := matchesQuality(b.Title, quality)
+	if aQuality != bQuality {
+		return aQuality
+	}
+	aPack := isSeasonPack(a.Title, season)
+	bPack := isSeasonPack(b.Title, season)
+	if aPack != bPack {
+		return aPack
+	}
+	return releaseScore(a, quality) > releaseScore(b, quality)
+}
+
+func isSeasonPack(title string, wantedSeason int) bool {
+	if wantedSeason <= 0 {
+		return false
+	}
+	if match := episodeRangeRE.FindStringSubmatch(title); len(match) == 2 {
+		season, _ := strconv.Atoi(match[1])
+		return season == wantedSeason
+	}
+	if episodeRE.MatchString(title) {
+		return false
+	}
+	for _, re := range []*regexp.Regexp{seasonOnlyRE, seasonWordRE} {
+		if match := re.FindStringSubmatch(title); len(match) == 2 {
+			season, _ := strconv.Atoi(match[1])
+			if season == wantedSeason {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func matchesQuality(title, quality string) bool {
 	title = strings.ToLower(title)
 	switch strings.ToLower(quality) {

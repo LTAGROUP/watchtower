@@ -171,3 +171,45 @@ func TestCreateRequestQueuesDirectlyWithoutPostingToSeerr(t *testing.T) {
 		t.Fatalf("request unexpectedly posted to Seerr: %#v", methods)
 	}
 }
+
+func TestRerequestEpisodeEndpointQueuesTargetAndKeepsExistingFileOnFailure(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 21, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 2}, Status: "ready"}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	existing := &model.File{ID: "existing", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E02 [1080p].mkv", Quality: "1080p"}
+	if err := st.AddFiles(existing); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &service.Resolver{
+		Config: config.Config{Qualities: []string{"1080p"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:  st, Scraper: failingCatalogSearcher{},
+	}
+	handler := (&Handler{Store: st, Resolver: resolver, Username: "admin", Password: "secret"}).Routes()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/media/21/rerequest", strings.NewReader(`{"season":1,"episode":2}`))
+	req.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", response.Code, response.Body.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		updated, _ := st.MediaByID(media.ID)
+		if updated.Status == "failed" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	updated, _ := st.MediaByID(media.ID)
+	if updated.Status != "failed" {
+		t.Fatalf("background re-request did not finish: %#v", updated)
+	}
+	if _, ok := st.File(existing.ID); !ok {
+		t.Fatal("failed re-request removed the existing episode")
+	}
+}

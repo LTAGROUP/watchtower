@@ -12,7 +12,8 @@ This project is intended for media you are authorized to access. It does not byp
 - release-date awareness that parks future movies and TV seasons as `unreleased` instead of repeatedly scraping them
 - direct WatchTower requests from the dashboard without creating a Seerr request
 - independent 2160p and 1080p release selection
-- season-pack expansion into Plex-compatible episode paths
+- season-pack-first TV selection with expansion into Plex-compatible episode paths
+- targeted season and single-episode re-requests that keep current files until replacements resolve
 - cached-only selection by default
 - HTTP Range and HEAD passthrough for seeking and Plex analysis
 - bounded sparse-file caching for fast Plex analysis, random seeks, and repeated playback

@@ -18,6 +18,7 @@ import (
 
 type recordingSearcher struct {
 	queries  []scraper.Query
+	limits   []int
 	releases []model.Release
 	err      error
 }
@@ -28,13 +29,19 @@ func (panicSearcher) Search(context.Context, scraper.Query, int) ([]model.Releas
 	panic("unreleased media must not be scraped")
 }
 
-func (s *recordingSearcher) Search(_ context.Context, query scraper.Query, _ int) ([]model.Release, error) {
+func (s *recordingSearcher) Search(_ context.Context, query scraper.Query, limit int) ([]model.Release, error) {
 	s.queries = append(s.queries, query)
+	s.limits = append(s.limits, limit)
 	return append([]model.Release(nil), s.releases...), s.err
 }
 
 type fixedProvider struct {
 	resolved model.Resolved
+}
+
+type recordingProvider struct {
+	titles  []string
+	results map[string]model.Resolved
 }
 
 type episodeSearcher struct {
@@ -62,6 +69,15 @@ func (p fixedProvider) Resolve(context.Context, model.Release) (model.Resolved, 
 	return p.resolved, nil
 }
 func (p fixedProvider) StreamURL(context.Context, *model.File) (string, error) {
+	return "", nil
+}
+
+func (p *recordingProvider) Name() string { return "test" }
+func (p *recordingProvider) Resolve(_ context.Context, release model.Release) (model.Resolved, error) {
+	p.titles = append(p.titles, release.Title)
+	return p.results[release.DownloadURL], nil
+}
+func (p *recordingProvider) StreamURL(context.Context, *model.File) (string, error) {
 	return "", nil
 }
 
@@ -95,6 +111,27 @@ func TestQualityAliases(t *testing.T) {
 	}
 	if matchesQuality("Example 720p", "1080p") {
 		t.Fatal("720p should not satisfy 1080p")
+	}
+}
+
+func TestSeasonPackDetection(t *testing.T) {
+	for _, title := range []string{
+		"Example.S01.1080p.BluRay",
+		"Example Season 1 Complete 1080p",
+		"Example.S01E01-E10.1080p",
+	} {
+		if !isSeasonPack(title, 1) {
+			t.Errorf("expected season pack: %q", title)
+		}
+	}
+	for _, title := range []string{
+		"Example.S01E02.1080p",
+		"Example.S02.1080p",
+		"Example.1080p",
+	} {
+		if isSeasonPack(title, 1) {
+			t.Errorf("unexpected season pack: %q", title)
+		}
 	}
 }
 
@@ -284,5 +321,179 @@ func TestResolverSeasonPackSatisfiesRemainingEpisodeJobs(t *testing.T) {
 	}
 	if len(searcher.queries) != 1 || searcher.queries[0].Episode != 1 {
 		t.Fatalf("expected the season pack to skip later episode searches, got %#v", searcher.queries)
+	}
+}
+
+func TestResolverExpandsSeasonPackWhenEpisodeCountIsUnknown(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 17, Type: "tv", Title: "Example", Seasons: []int{1}}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &recordingSearcher{releases: []model.Release{{Title: "Example.S01.1080p", Seeders: 10}}}
+	resolver := &Resolver{
+		Config:  config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:   st,
+		Scraper: searcher,
+		Providers: map[string]debrid.Provider{"test": fixedProvider{resolved: model.Resolved{ItemID: "season-pack", Cached: true, Files: []model.RemoteFile{
+			{ID: "1", Name: "Example.S01E01.mkv", Size: 100},
+			{ID: "2", Name: "Example.S01E02.mkv", Size: 100},
+			{ID: "3", Name: "Example.S01E03.mkv", Size: 100},
+		}}}},
+	}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.FilesForMedia(media.ID)) != 3 {
+		t.Fatalf("season pack was not fully expanded: %#v", st.FilesForMedia(media.ID))
+	}
+}
+
+func TestResolverPrefersSeasonPackOverHigherSeededEpisode(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 13, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 3}}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &recordingSearcher{releases: []model.Release{
+		{Title: "Example.S01E01.1080p", DownloadURL: "episode", Seeders: 500},
+		{Title: "Example.S01.1080p", DownloadURL: "pack", Seeders: 2},
+	}}
+	provider := &recordingProvider{results: map[string]model.Resolved{
+		"episode": {ItemID: "episode", Cached: true, Files: []model.RemoteFile{{ID: "1", Name: "Example.S01E01.mkv", Size: 100}}},
+		"pack": {ItemID: "pack", Cached: true, Files: []model.RemoteFile{
+			{ID: "1", Name: "Example.S01E01.mkv", Size: 100},
+			{ID: "2", Name: "Example.S01E02.mkv", Size: 100},
+			{ID: "3", Name: "Example.S01E03.mkv", Size: 100},
+		}},
+	}}
+	resolver := &Resolver{
+		Config: config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 1, ResolveTimeout: time.Second},
+		Store:  st, Scraper: searcher, Providers: map[string]debrid.Provider{"test": provider},
+	}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.titles) != 1 || provider.titles[0] != "Example.S01.1080p" {
+		t.Fatalf("season pack was not tried first: %#v", provider.titles)
+	}
+	if len(searcher.queries) != 1 || searcher.limits[0] != 0 || len(st.FilesForMedia(media.ID)) != 3 {
+		t.Fatalf("preferred pack did not complete the season: queries=%#v files=%#v", searcher.queries, st.FilesForMedia(media.ID))
+	}
+}
+
+func TestRerequestSeasonReplacesWholeSeasonFromPack(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 16, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 2}, Status: "ready"}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddFiles(
+		&model.File{ID: "old-1", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E01 [1080p].mkv", Quality: "1080p", Provider: "old"},
+		&model.File{ID: "old-2", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E02 [1080p].mkv", Quality: "1080p", Provider: "old"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &recordingSearcher{releases: []model.Release{{Title: "Example.S01.1080p", DownloadURL: "pack", Seeders: 2}}}
+	provider := &recordingProvider{results: map[string]model.Resolved{
+		"pack": {ItemID: "pack", Cached: true, Files: []model.RemoteFile{
+			{ID: "1", Name: "Example.S01E01.mkv", Size: 100},
+			{ID: "2", Name: "Example.S01E02.mkv", Size: 100},
+		}},
+	}}
+	resolver := &Resolver{
+		Config: config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:  st, Scraper: searcher, Providers: map[string]debrid.Provider{"test": provider},
+	}
+	if err := resolver.Rerequest(context.Background(), media, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(searcher.queries) != 1 || len(st.FilesForMedia(media.ID)) != 2 {
+		t.Fatalf("season pack did not replace the season: queries=%#v files=%#v", searcher.queries, st.FilesForMedia(media.ID))
+	}
+	if _, ok := st.File("old-1"); ok {
+		t.Fatal("episode 1 kept its old source")
+	}
+	if _, ok := st.File("old-2"); ok {
+		t.Fatal("episode 2 kept its old source")
+	}
+}
+
+func TestRerequestSingleEpisodeReplacesOnlyThatEpisode(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 14, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 3}, Status: "ready"}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddFiles(
+		&model.File{ID: "old-1", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E01 [1080p].mkv", Quality: "1080p", Provider: "old"},
+		&model.File{ID: "old-2", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E02 [1080p].mkv", Quality: "1080p", Provider: "old"},
+		&model.File{ID: "old-3", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E03 [1080p].mkv", Quality: "1080p", Provider: "old"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &episodeSearcher{}
+	resolver := &Resolver{
+		Config: config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:  st, Scraper: searcher, Providers: map[string]debrid.Provider{"test": episodeProvider{}},
+	}
+	if err := resolver.Rerequest(context.Background(), media, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if len(searcher.queries) != 1 || searcher.queries[0].Episode != 2 {
+		t.Fatalf("expected only episode 2 to be searched, got %#v", searcher.queries)
+	}
+	files := st.FilesForMedia(media.ID)
+	if len(files) != 3 {
+		t.Fatalf("expected three files after re-request, got %#v", files)
+	}
+	if _, ok := st.File("old-1"); !ok {
+		t.Fatal("episode 1 was replaced")
+	}
+	if _, ok := st.File("old-3"); !ok {
+		t.Fatal("episode 3 was replaced")
+	}
+	if _, ok := st.File("old-2"); ok {
+		t.Fatal("episode 2 kept its old source")
+	}
+}
+
+func TestRerequestKeepsExistingEpisodeWhenReplacementFails(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 15, Type: "tv", Title: "Example", Seasons: []int{1}, EpisodeCounts: map[int]int{1: 1}, Status: "ready"}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	existing := &model.File{ID: "old", MediaID: media.ID, Path: "TV/Example/Season 01/Example - S01E01 [1080p].mkv", Quality: "1080p", Provider: "old"}
+	if err := st.AddFiles(existing); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &Resolver{
+		Config: config.Config{Qualities: []string{"1080p"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:  st, Scraper: &recordingSearcher{},
+	}
+	if err := resolver.Rerequest(context.Background(), media, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if media.Status != "failed" {
+		t.Fatalf("expected failed re-request status, got %s", media.Status)
+	}
+	if _, ok := st.File(existing.ID); !ok {
+		t.Fatal("existing episode was removed after failed re-request")
 	}
 }

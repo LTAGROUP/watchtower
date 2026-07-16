@@ -263,7 +263,8 @@ dialog::backdrop { background: rgba(4,5,8,.75); backdrop-filter: blur(5px); }
 .detail-section-head { display: flex; align-items: baseline; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
 .detail-section-head span { font-size: 9px; }
 .detail-seasons { display: flex; gap: 7px; flex-wrap: wrap; padding-top: 12px; }
-.detail-season { min-width: 132px; padding: 8px 11px; background: #1a1e26; border: 1px solid #292f39; border-radius: 8px; color: #b9c0ca; font: inherit; text-align: left; cursor: pointer; transition: border-color .16s, background .16s, transform .16s; }
+.detail-season-item { min-width: 142px; display: grid; gap: 4px; }
+.detail-season { width: 100%; padding: 8px 11px; background: #1a1e26; border: 1px solid #292f39; border-radius: 8px; color: #b9c0ca; font: inherit; text-align: left; cursor: pointer; transition: border-color .16s, background .16s, transform .16s; }
 .detail-season:hover { border-color: #4a5260; transform: translateY(-1px); }
 .detail-season:focus-visible { outline: 0; box-shadow: 0 0 0 3px rgba(255, 107, 53, .24); }
 .detail-season.active { border-color: rgba(255, 107, 53, .7); background: rgba(255, 107, 53, .1); }
@@ -271,10 +272,14 @@ dialog::backdrop { background: rgba(4,5,8,.75); backdrop-filter: blur(5px); }
 .detail-season strong { color: #dce0e6; font-size: 9px; }
 .detail-season small { margin-top: 4px; color: var(--muted); font-size: 8px; }
 .detail-season.active small { color: #ff9a73; }
+.detail-season-action { border: 0; background: transparent; color: var(--accent); font-size: 8px; font-weight: 750; text-align: left; padding: 2px 5px; cursor: pointer; }
+.detail-season-action:hover { color: #ff9a73; }
 .detail-files { display: grid; gap: 7px; padding-top: 12px; }
 .detail-file { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 12px; align-items: center; padding: 12px 13px; border: 1px solid #292f39; border-radius: 9px; background: #171a21; }
 .detail-file strong { display: block; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .detail-file small { display: block; color: var(--muted); font-size: 8px; margin-top: 5px; }
+.detail-file-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+.button.compact { height: 29px; padding: 0 9px; font-size: 9px; }
 .stream-pill { padding: 5px 8px; border-radius: 20px; background: rgba(114,214,160,.08); color: var(--good); font-size: 8px; font-weight: 800; text-transform: capitalize; }
 .detail-loading { min-height: 420px; display: grid; place-items: center; color: var(--muted); }
 

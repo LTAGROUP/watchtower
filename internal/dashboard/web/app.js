@@ -280,18 +280,28 @@ function renderDetailSeasons() {
     const total = Number(season.episodeCount || data.media?.episodeCounts?.[number] || 0);
     const count = data.inLibrary ? (total > 0 ? `${owned} out of ${total} episodes` : `${owned} episode${owned === 1 ? '' : 's'} in library`) : `${total} episode${total === 1 ? '' : 's'}`;
     const active = selectedSeason === number;
-    return `<button type="button" class="detail-season${active ? ' active' : ''}" data-detail-season="${number}" aria-pressed="${active}"><strong>Season ${number}</strong><small>${escapeHTML(count)}</small></button>`;
+    const tracked = (data.media?.seasons || []).map(Number).includes(number);
+    const action = data.inLibrary && tracked ? `<button type="button" class="detail-season-action" data-rerequest-season="${number}">Re-request season</button>` : '';
+    return `<div class="detail-season-item"><button type="button" class="detail-season${active ? ' active' : ''}" data-detail-season="${number}" aria-pressed="${active}"><strong>Season ${number}</strong><small>${escapeHTML(count)}</small></button>${action}</div>`;
   }).join('') || '<span class="muted">Season information unavailable</span>';
 }
 
 function renderDetailFiles() {
   if (!state.detail) return;
-  const {data, season} = state.detail;
+  const {data, type, season} = state.detail;
   const allFiles = [...(data.files || [])].sort(compareEpisodeFiles);
   const files = season == null ? allFiles : allFiles.filter(file => episodeRef(file.path)?.season === season);
   $('#detail-file-count').textContent = `${files.length} file${files.length === 1 ? '' : 's'}${season == null ? '' : ` · Season ${season}`}`;
   const empty = season == null ? (data.inLibrary ? 'No files have been resolved yet.' : 'Request this title to create stream files.') : `No files for Season ${season} have been resolved yet.`;
-  $('#detail-files').innerHTML = files.length ? files.map(file => `<article class="detail-file"><div><strong title="${escapeHTML(file.path)}">${escapeHTML(lastPath(file.path))}</strong><small>${escapeHTML(file.quality)} · ${escapeHTML(file.provider)} · ${formatBytes(file.size)}<br>${escapeHTML(file.path)}</small></div><span class="stream-pill">${escapeHTML(file.streamState || 'on demand')}</span></article>`).join('') : `<div class="empty-state">${escapeHTML(empty)}</div>`;
+  const episodeActions = new Set();
+  $('#detail-files').innerHTML = files.length ? files.map(file => {
+    const ref = episodeRef(file.path);
+    const key = ref ? `${ref.season}:${ref.episode}` : '';
+    const tracked = ref && (data.media?.seasons || []).map(Number).includes(ref.season);
+    const action = data.inLibrary && type === 'tv' && tracked && !episodeActions.has(key) ? `<button type="button" class="button ghost compact" data-rerequest-season="${ref.season}" data-rerequest-episode="${ref.episode}">Re-request episode</button>` : '';
+    if (action) episodeActions.add(key);
+    return `<article class="detail-file"><div><strong title="${escapeHTML(file.path)}">${escapeHTML(lastPath(file.path))}</strong><small>${escapeHTML(file.quality)} · ${escapeHTML(file.provider)} · ${formatBytes(file.size)}<br>${escapeHTML(file.path)}</small></div><div class="detail-file-actions"><span class="stream-pill">${escapeHTML(file.streamState || 'on demand')}</span>${action}</div></article>`;
+  }).join('') : `<div class="empty-state">${escapeHTML(empty)}</div>`;
 }
 
 async function openRequest(button) {
@@ -340,6 +350,22 @@ async function resetMedia(id, button) {
     await api(`/api/v1/media/${id}/reset`, {method:'POST'});
     state.detailCache.clear();
     showNotice('Missing-file retry started. Existing files will be kept.');
+    setTimeout(() => refreshAll(true), 700);
+    $('#media-dialog').close();
+  } catch (error) { showNotice(error.message, true); if (button) button.disabled = false; }
+}
+
+async function rerequestMedia(season, episode, button) {
+  const mediaId = state.detail?.data?.media?.id;
+  if (!mediaId || !season) return;
+  if (button) button.disabled = true;
+  const payload = {season:Number(season)};
+  if (episode) payload.episode = Number(episode);
+  try {
+    await api(`/api/v1/media/${mediaId}/rerequest`, {method:'POST', body:JSON.stringify(payload)});
+    state.detailCache.clear();
+    const target = episode ? `S${String(season).padStart(2,'0')}E${String(episode).padStart(2,'0')}` : `Season ${season}`;
+    showNotice(`${target} re-request started. Current files will be kept until replacements are found.`);
     setTimeout(() => refreshAll(true), 700);
     $('#media-dialog').close();
   } catch (error) { showNotice(error.message, true); if (button) button.disabled = false; }
@@ -453,6 +479,8 @@ document.addEventListener('click', event => {
   if (request) { event.stopPropagation(); openRequest(request); return; }
   const reset = event.target.closest('[data-reset-id]');
   if (reset) { event.stopPropagation(); resetMedia(reset.dataset.resetId, reset); return; }
+  const rerequest = event.target.closest('[data-rerequest-season]');
+  if (rerequest) { event.stopPropagation(); rerequestMedia(rerequest.dataset.rerequestSeason, rerequest.dataset.rerequestEpisode, rerequest); return; }
   const remove = event.target.closest('[data-delete-id]');
   if (remove) { event.stopPropagation(); deleteMedia(remove.dataset.deleteId, remove.dataset.deleteTitle, remove); return; }
   const season = event.target.closest('[data-detail-season]');
