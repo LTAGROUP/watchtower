@@ -78,3 +78,23 @@ func TestMediaReleaseDateUsesRequestedEpisodeSchedule(t *testing.T) {
 		t.Fatalf("unexpected movie release date: %q", got)
 	}
 }
+
+func TestImportableSeerrRequestStatuses(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		{name: "approved", status: seerrRequestApproved, want: true},
+		{name: "completed", status: seerrRequestCompleted, want: true},
+		{name: "pending", status: 1, want: false},
+		{name: "declined", status: 3, want: false},
+		{name: "failed", status: 4, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := importableSeerrRequestStatus(test.status); got != test.want {
+				t.Fatalf("status %d importable=%t, want %t", test.status, got, test.want)
+			}
+		})
+	}
+}

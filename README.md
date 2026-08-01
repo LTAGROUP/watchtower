@@ -8,7 +8,7 @@ This project is intended for media you are authorized to access. It does not byp
 
 - TorBox and AllDebrid provider adapters
 - direct aggregation of Torrentio, Comet, StremThru, and other Stremio-compatible scraper endpoints
-- webhook-triggered imports of approved Seerr movie and TV requests with polling fallback
+- webhook-triggered imports of approved and completed Seerr movie and TV requests with polling fallback
 - release-date awareness that parks future movies and TV seasons as `unreleased` instead of repeatedly scraping them
 - direct WatchTower requests from the dashboard without creating a Seerr request
 - independent 2160p and 1080p release selection
@@ -81,9 +81,10 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
 
 7. WatchTower uses Seerr as the discovery and metadata catalog, but requests made
    from the WatchTower dashboard are queued directly in WatchTower. Existing
-   approved Seerr requests can still be imported by the poller. If you use that
-   legacy path, configure working Radarr/Sonarr service entries with automatic
-   searching disabled (`preventSearch`) to avoid a second download workflow.
+   approved or completed Seerr requests can be imported by the poller, including
+   requests completed by a previous Riven workflow. If you use that legacy path,
+   configure working Radarr/Sonarr service entries with automatic searching
+   disabled (`preventSearch`) to avoid a second download workflow.
 
 8. To import Seerr requests immediately, open **Settings → Notifications → Webhook** in Seerr and configure:
 

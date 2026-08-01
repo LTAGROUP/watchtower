@@ -30,6 +30,12 @@ type Seerr struct {
 	wakeOnce        sync.Once
 	wake            chan struct{}
 }
+
+const (
+	seerrRequestApproved  = 2
+	seerrRequestCompleted = 5
+)
+
 type seerrPage struct {
 	Results []seerrRequest `json:"results"`
 }
@@ -170,15 +176,20 @@ func (s *Seerr) poll(ctx context.Context) {
 	}
 	queued := 0
 	for _, x := range page.Results {
-		if x.Status != 2 || s.Store.IsProcessed(x.ID) {
+		if !importableSeerrRequestStatus(x.Status) || s.Store.IsProcessed(x.ID) {
 			continue
 		}
 		x := x
 		queued++
 		go s.handle(context.Background(), x)
 	}
-	s.Log.Info("seerr poll completed", "component", "seerr", "requests", len(page.Results), "new_approved_requests", queued, "duration", time.Since(started).String())
+	s.Log.Info("seerr poll completed", "component", "seerr", "requests", len(page.Results), "new_importable_requests", queued, "duration", time.Since(started).String())
 }
+
+func importableSeerrRequestStatus(status int) bool {
+	return status == seerrRequestApproved || status == seerrRequestCompleted
+}
+
 func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	if _, loaded := s.inflight.LoadOrStore(x.ID, struct{}{}); loaded {
 		return
