@@ -34,10 +34,18 @@ type Seerr struct {
 const (
 	seerrRequestApproved  = 2
 	seerrRequestCompleted = 5
+	seerrRequestPageSize  = 100
 )
 
+type seerrPageInfo struct {
+	Pages    int `json:"pages"`
+	PageSize int `json:"pageSize"`
+	Page     int `json:"page"`
+}
+
 type seerrPage struct {
-	Results []seerrRequest `json:"results"`
+	Results  []seerrRequest `json:"results"`
+	PageInfo seerrPageInfo  `json:"pageInfo"`
 }
 type seerrRequest struct {
 	ID     int64  `json:"id"`
@@ -157,33 +165,71 @@ func (s *Seerr) poll(ctx context.Context) {
 	}
 	started := time.Now()
 	s.Log.Info("seerr poll started", "component", "seerr")
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, cfg.SeerrURL+"/api/v1/request?take=100&skip=0&sort=added", nil)
+	queued := 0
+	requestCount := 0
+	pageCount := 0
+	for skip := 0; ; {
+		page, e := s.requestPage(ctx, cfg, skip)
+		if e != nil {
+			s.Log.Error("seerr poll", "error", e, "skip", skip)
+			return
+		}
+		pageCount++
+		requestCount += len(page.Results)
+		for _, x := range page.Results {
+			if !importableSeerrRequestStatus(x.Status) || s.Store.IsProcessed(x.ID) {
+				continue
+			}
+			x := x
+			queued++
+			go s.handle(context.Background(), x)
+		}
+		if !seerrPageHasNext(page) {
+			break
+		}
+		skip += len(page.Results)
+	}
+	s.Log.Info("seerr poll completed", "component", "seerr", "requests", requestCount, "pages", pageCount, "new_importable_requests", queued, "duration", time.Since(started).String())
+}
+
+func (s *Seerr) requestPage(ctx context.Context, cfg config.Config, skip int) (seerrPage, error) {
+	values := url.Values{
+		"take":          {strconv.Itoa(seerrRequestPageSize)},
+		"skip":          {strconv.Itoa(skip)},
+		"sortDirection": {"asc"},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.SeerrURL+"/api/v1/request?"+values.Encode(), nil)
+	if err != nil {
+		return seerrPage{}, err
+	}
 	req.Header.Set("X-Api-Key", cfg.SeerrAPIKey)
-	resp, e := s.Client.Do(req)
-	if e != nil {
-		s.Log.Error("seerr poll", "error", e)
-		return
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return seerrPage{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		s.Log.Error("seerr poll", "status", resp.Status)
-		return
+		return seerrPage{}, fmt.Errorf("Seerr request list returned %s", resp.Status)
 	}
 	var page seerrPage
-	if e = json.NewDecoder(resp.Body).Decode(&page); e != nil {
-		s.Log.Error("seerr decode", "error", e)
-		return
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return seerrPage{}, fmt.Errorf("decode Seerr request list: %w", err)
 	}
-	queued := 0
-	for _, x := range page.Results {
-		if !importableSeerrRequestStatus(x.Status) || s.Store.IsProcessed(x.ID) {
-			continue
-		}
-		x := x
-		queued++
-		go s.handle(context.Background(), x)
+	return page, nil
+}
+
+func seerrPageHasNext(page seerrPage) bool {
+	if len(page.Results) == 0 {
+		return false
 	}
-	s.Log.Info("seerr poll completed", "component", "seerr", "requests", len(page.Results), "new_importable_requests", queued, "duration", time.Since(started).String())
+	if page.PageInfo.Pages > 0 && page.PageInfo.Page > 0 {
+		return page.PageInfo.Page < page.PageInfo.Pages
+	}
+	pageSize := page.PageInfo.PageSize
+	if pageSize <= 0 {
+		pageSize = seerrRequestPageSize
+	}
+	return len(page.Results) >= pageSize
 }
 
 func importableSeerrRequestStatus(status int) bool {
