@@ -53,12 +53,6 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
    docker compose up -d --build
    ```
 
-   To include a fresh Seerr container:
-
-   ```sh
-   docker compose --profile bundled up -d --build
-   ```
-
    Open `http://localhost:3001` and sign in with `DASHBOARD_USERNAME` and
    `DASHBOARD_PASSWORD`. Both values are configured in `.env`; change the example
    password before exposing the dashboard beyond your local network.
@@ -88,7 +82,7 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
 
 8. To import Seerr requests immediately, open **Settings → Notifications → Webhook** in Seerr and configure:
 
-   - URL: `http://watchtower:8080/webhooks/seerr` when Seerr runs on the Compose network; use a reachable reverse-proxy URL for a remote Seerr instance.
+   - URL: `http://<watchtower-host>:8080/webhooks/seerr` when Seerr runs in a separate stack. If both stacks share an external Docker network, `http://watchtower:8080/webhooks/seerr` also works.
    - JSON Payload: `{"notification_type":"{{notification_type}}"}`
    - Enable the **Request Approved** and **Request Automatically Approved** events.
 
@@ -101,10 +95,12 @@ Check operation with:
 
 ```sh
 docker compose logs -f watchtower mount
-curl http://localhost:8080/healthz # only if port 8080 is published for debugging
+curl http://localhost:8080/healthz
 ```
 
-The core port is intentionally not published. Add `ports: ["8080:8080"]` under `watchtower` temporarily if direct diagnostics are needed.
+The core port is published as `${WATCHTOWER_CORE_PORT:-8080}` so the separate
+Seerr stack can reach the webhook. Use the Docker host's LAN IP in Seerr, not
+`localhost` (which points back to the Seerr container).
 
 ## Policy settings
 
@@ -120,6 +116,7 @@ The core port is intentionally not published. Add `ports: ["8080:8080"]` under `
 | `STREAM_URL_TTL` | `45m` | Proactive URL refresh interval |
 | `LOG_COLOR` | `true` | Use colors and text styling in console logs; set to `false` for plain-text log collectors |
 | `SEERR_POLL_INTERVAL` | `2m` | Approved-request polling interval |
+| `WATCHTOWER_CORE_PORT` | `8080` | Host port for the core API, WebDAV, health check, and Seerr webhook |
 | `PLEX_URL` | empty | Plex server URL reachable from WatchTower |
 | `PLEX_TOKEN` | empty | Plex access token used only for library refresh requests |
 | `PLEX_SCAN_DELAY` | `45s` | Delay/batch window before refreshing Plex; should exceed rclone's directory cache time |

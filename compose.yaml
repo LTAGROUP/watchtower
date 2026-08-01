@@ -8,6 +8,7 @@ services:
         required: false
     ports:
       - "${DASHBOARD_PORT:-3001}:3001"
+      - "${WATCHTOWER_CORE_PORT:-8080}:8080"
     volumes:
       - watchtower-data:/data
     networks: [media]
@@ -60,21 +61,9 @@ services:
           create_host_path: true
     networks: [media]
 
-  seerr:
-    image: ghcr.io/seerr-team/seerr:latest
-    profiles: [bundled]
-    restart: unless-stopped
-    environment:
-      TZ: ${TZ:-Etc/UTC}
-    volumes:
-      - seerr-data:/app/config
-    ports: ["5055:5055"]
-    networks: [media]
-
 networks:
   media:
 
 volumes:
   watchtower-data:
   watchtower-cache:
-  seerr-data:
