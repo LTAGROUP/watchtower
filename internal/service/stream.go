@@ -18,16 +18,24 @@ import (
 )
 
 type Streamer struct {
-	Store           *store.Store
-	Providers       map[string]debrid.Provider
-	ProviderFactory func(config.Config) map[string]debrid.Provider
-	Settings        func() config.Config
-	Repair          func(context.Context, *model.File) (*model.File, error)
-	Client          *http.Client
-	TTL             time.Duration
-	RetryBackoff    time.Duration
-	Log             *slog.Logger
-	mu              sync.Mutex
+	Store            *store.Store
+	Providers        map[string]debrid.Provider
+	ProviderFactory  func(config.Config) map[string]debrid.Provider
+	Settings         func() config.Config
+	Repair           func(context.Context, *model.File) (*model.File, error)
+	Client           *http.Client
+	TTL              time.Duration
+	RetryBackoff     time.Duration
+	Log              *slog.Logger
+	mu               sync.Mutex
+	refreshes        map[string]*streamRefresh
+	rateLimitedUntil map[string]time.Time
+}
+
+type streamRefresh struct {
+	done chan struct{}
+	url  string
+	err  error
 }
 
 func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) {
@@ -39,6 +47,11 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		u, e := s.url(r.Context(), f, attempt > 0)
 		if e != nil {
+			if errors.Is(e, debrid.ErrRateLimited) {
+				w.Header().Set("Retry-After", "30")
+				http.Error(w, e.Error(), http.StatusTooManyRequests)
+				return
+			}
 			willRetry := errors.Is(e, debrid.ErrTransient) && attempt+1 < maxAttempts
 			if s.Log != nil {
 				attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt + 1, "will_retry", willRetry, "error", e}
@@ -161,7 +174,44 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		}
 		return u, nil
 	}
+	if until := s.rateLimitedUntil[current.Provider]; time.Now().Before(until) {
+		s.mu.Unlock()
+		return "", fmt.Errorf("%w: provider %q retry after %s", debrid.ErrRateLimited, current.Provider, time.Until(until).Round(time.Second))
+	}
+	if s.refreshes == nil {
+		s.refreshes = map[string]*streamRefresh{}
+	}
+	if s.rateLimitedUntil == nil {
+		s.rateLimitedUntil = map[string]time.Time{}
+	}
+	if refresh := s.refreshes[current.ID]; refresh != nil {
+		s.mu.Unlock()
+		select {
+		case <-refresh.done:
+			return refresh.url, refresh.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	refresh := &streamRefresh{done: make(chan struct{})}
+	s.refreshes[current.ID] = refresh
 	s.mu.Unlock()
+
+	u, err := s.refreshURL(ctx, current, attached, force)
+	s.mu.Lock()
+	delete(s.refreshes, current.ID)
+	if errors.Is(err, debrid.ErrRateLimited) {
+		s.rateLimitedUntil[current.Provider] = time.Now().Add(30 * time.Second)
+	} else if err == nil {
+		delete(s.rateLimitedUntil, current.Provider)
+	}
+	refresh.url, refresh.err = u, err
+	close(refresh.done)
+	s.mu.Unlock()
+	return u, err
+}
+
+func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached, force bool) (string, error) {
 	reason := "missing"
 	if force && current.StreamURL != "" {
 		reason = "upstream rejected previous link"

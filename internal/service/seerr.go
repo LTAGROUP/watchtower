@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ type Seerr struct {
 	Client          *http.Client
 	Log             *slog.Logger
 	inflight        sync.Map
+	mediaInflight   sync.Map
 	releaseInflight sync.Map
 	wakeOnce        sync.Once
 	wake            chan struct{}
@@ -48,18 +50,21 @@ type seerrPage struct {
 	PageInfo seerrPageInfo  `json:"pageInfo"`
 }
 type seerrRequest struct {
-	ID     int64  `json:"id"`
-	Status int    `json:"status"`
-	Type   string `json:"type"`
-	Is4K   bool   `json:"is4k"`
-	Media  struct {
+	ID         int64   `json:"id"`
+	Status     int     `json:"status"`
+	Type       string  `json:"type"`
+	Is4K       bool    `json:"is4k"`
+	RequestIDs []int64 `json:"-"`
+	Media      struct {
 		ID        int64  `json:"id"`
 		TMDBID    int64  `json:"tmdbId"`
 		MediaType string `json:"mediaType"`
 	} `json:"media"`
-	Seasons []struct {
-		SeasonNumber int `json:"seasonNumber"`
-	} `json:"seasons"`
+	Seasons []seerrSeasonRequest `json:"seasons"`
+}
+
+type seerrSeasonRequest struct {
+	SeasonNumber int `json:"seasonNumber"`
 }
 type CatalogSeason struct {
 	SeasonNumber int    `json:"seasonNumber"`
@@ -168,6 +173,8 @@ func (s *Seerr) poll(ctx context.Context) {
 	queued := 0
 	requestCount := 0
 	pageCount := 0
+	duplicateRequests := 0
+	pending := map[string]seerrRequest{}
 	for skip := 0; ; {
 		page, e := s.requestPage(ctx, cfg, skip)
 		if e != nil {
@@ -180,16 +187,31 @@ func (s *Seerr) poll(ctx context.Context) {
 			if !importableSeerrRequestStatus(x.Status) || s.Store.IsProcessed(x.ID) {
 				continue
 			}
-			x := x
-			queued++
-			go s.handle(context.Background(), x)
+			key := seerrRequestMediaKey(x)
+			if existing, ok := pending[key]; ok {
+				existing.Seasons = mergeSeerrSeasons(existing.Seasons, x.Seasons)
+				if x.ID > 0 {
+					existing.RequestIDs = append(existing.RequestIDs, x.ID)
+				}
+				pending[key] = existing
+				duplicateRequests++
+				continue
+			}
+			if x.ID > 0 {
+				x.RequestIDs = []int64{x.ID}
+			}
+			pending[key] = x
 		}
 		if !seerrPageHasNext(page) {
 			break
 		}
 		skip += len(page.Results)
 	}
-	s.Log.Info("seerr poll completed", "component", "seerr", "requests", requestCount, "pages", pageCount, "new_importable_requests", queued, "duration", time.Since(started).String())
+	for _, x := range pending {
+		queued++
+		go s.handle(context.Background(), x)
+	}
+	s.Log.Info("seerr poll completed", "component", "seerr", "requests", requestCount, "pages", pageCount, "new_importable_requests", queued, "duplicate_requests_collapsed", duplicateRequests, "duration", time.Since(started).String())
 }
 
 func (s *Seerr) requestPage(ctx context.Context, cfg config.Config, skip int) (seerrPage, error) {
@@ -236,13 +258,7 @@ func importableSeerrRequestStatus(status int) bool {
 	return status == seerrRequestApproved || status == seerrRequestCompleted
 }
 
-func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
-	if _, loaded := s.inflight.LoadOrStore(x.ID, struct{}{}); loaded {
-		return
-	}
-	defer s.inflight.Delete(x.ID)
-	started := time.Now()
-	s.Log.Info("seerr request processing started", "component", "seerr", "request", x.ID, "tmdb_id", x.Media.TMDBID)
+func seerrRequestKind(x seerrRequest) string {
 	kind := strings.ToLower(x.Type)
 	if kind == "" {
 		kind = strings.ToLower(x.Media.MediaType)
@@ -250,6 +266,42 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 	if kind != "tv" {
 		kind = "movie"
 	}
+	return kind
+}
+
+func seerrRequestMediaKey(x seerrRequest) string {
+	if x.Media.TMDBID > 0 {
+		return fmt.Sprintf("%s:%d", seerrRequestKind(x), x.Media.TMDBID)
+	}
+	return fmt.Sprintf("%s:media:%d", seerrRequestKind(x), x.Media.ID)
+}
+
+func mergeSeerrSeasons(left, right []seerrSeasonRequest) []seerrSeasonRequest {
+	seen := make(map[int]bool, len(left)+len(right))
+	merged := make([]seerrSeasonRequest, 0, len(left)+len(right))
+	for _, season := range append(append([]seerrSeasonRequest(nil), left...), right...) {
+		if season.SeasonNumber > 0 && !seen[season.SeasonNumber] {
+			seen[season.SeasonNumber] = true
+			merged = append(merged, season)
+		}
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].SeasonNumber < merged[j].SeasonNumber })
+	return merged
+}
+
+func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
+	if _, loaded := s.inflight.LoadOrStore(x.ID, struct{}{}); loaded {
+		return
+	}
+	defer s.inflight.Delete(x.ID)
+	mediaKey := seerrRequestMediaKey(x)
+	if _, loaded := s.mediaInflight.LoadOrStore(mediaKey, struct{}{}); loaded {
+		return
+	}
+	defer s.mediaInflight.Delete(mediaKey)
+	started := time.Now()
+	s.Log.Info("seerr request processing started", "component", "seerr", "request", x.ID, "tmdb_id", x.Media.TMDBID)
+	kind := seerrRequestKind(x)
 	d, e := s.Catalog(ctx, kind, x.Media.TMDBID)
 	if e != nil {
 		s.Log.Error("seerr details", "request", x.ID, "error", e)
@@ -283,12 +335,24 @@ func (s *Seerr) handle(ctx context.Context, x seerrRequest) {
 		return
 	}
 	if m.Status == "ready" || m.Status == "partial" || m.Status == "unreleased" {
-		_ = s.Store.MarkProcessed(x.ID)
+		for _, requestID := range seerrRequestIDs(x) {
+			_ = s.Store.MarkProcessed(requestID)
+		}
 		if m.Status != "unreleased" {
 			s.markAvailable(ctx, x.Media.ID)
 		}
 	}
 	s.Log.Info("seerr request processing completed", "component", "seerr", "request", x.ID, "title", title, "status", m.Status, "duration", time.Since(started).String())
+}
+
+func seerrRequestIDs(x seerrRequest) []int64 {
+	if len(x.RequestIDs) > 0 {
+		return x.RequestIDs
+	}
+	if x.ID > 0 {
+		return []int64{x.ID}
+	}
+	return nil
 }
 func (s *Seerr) Catalog(ctx context.Context, kind string, id int64) (CatalogDetails, error) {
 	if kind != "movie" && kind != "tv" {

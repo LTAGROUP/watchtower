@@ -149,6 +149,9 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 	if e != nil {
 		return "", e
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return "", fmt.Errorf("%w: torbox request download returned %s: %s", ErrRateLimited, resp.Status, strings.TrimSpace(string(body)))
+	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 		return "", fmt.Errorf("%w: torbox download item returned %s", ErrStaleItem, resp.Status)
 	}
@@ -178,6 +181,9 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 	}
 	if staleTorboxMessage(detail) {
 		return "", fmt.Errorf("%w: %s", ErrStaleItem, detail)
+	}
+	if strings.Contains(strings.ToLower(detail), "rate limit") {
+		return "", fmt.Errorf("%w: %s", ErrRateLimited, detail)
 	}
 	if transientTorboxMessage(detail) {
 		return "", fmt.Errorf("%w: %s", ErrTransient, detail)

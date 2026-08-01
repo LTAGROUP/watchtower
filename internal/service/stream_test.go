@@ -34,6 +34,19 @@ type transientLinkProvider struct {
 	failures int
 }
 
+type blockingLinkProvider struct {
+	mu      sync.Mutex
+	url     string
+	calls   int
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type rateLimitedLinkProvider struct {
+	calls int
+}
+
 type disconnectWriter struct {
 	header http.Header
 	status int
@@ -83,6 +96,32 @@ func (p *transientLinkProvider) StreamURL(context.Context, *model.File) (string,
 		return "", fmt.Errorf("%w: gateway unavailable", debrid.ErrTransient)
 	}
 	return p.url, nil
+}
+
+func (p *blockingLinkProvider) Name() string { return "test" }
+func (p *blockingLinkProvider) Resolve(context.Context, model.Release) (model.Resolved, error) {
+	return model.Resolved{}, nil
+}
+func (p *blockingLinkProvider) StreamURL(ctx context.Context, _ *model.File) (string, error) {
+	p.mu.Lock()
+	p.calls++
+	p.once.Do(func() { close(p.started) })
+	p.mu.Unlock()
+	select {
+	case <-p.release:
+		return p.url, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (p *rateLimitedLinkProvider) Name() string { return "test" }
+func (p *rateLimitedLinkProvider) Resolve(context.Context, model.Release) (model.Resolved, error) {
+	return model.Resolved{}, nil
+}
+func (p *rateLimitedLinkProvider) StreamURL(context.Context, *model.File) (string, error) {
+	p.calls++
+	return "", fmt.Errorf("%w: too many requests", debrid.ErrRateLimited)
 }
 
 func TestStreamerRefreshesURLAfterProviderServerError(t *testing.T) {
@@ -180,6 +219,71 @@ func TestStreamerRetriesTransientLinkGenerationFailures(t *testing.T) {
 	}
 	if provider.calls != 3 {
 		t.Fatalf("expected three link attempts, got %d", provider.calls)
+	}
+}
+
+func TestStreamerCoalescesConcurrentLinkRefreshes(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test"}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &blockingLinkProvider{url: "https://example.test/stream", started: make(chan struct{}), release: make(chan struct{})}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, TTL: time.Hour}
+	type result struct {
+		url string
+		err error
+	}
+	results := make(chan result, 2)
+	go func() {
+		u, e := streamer.url(context.Background(), file, false)
+		results <- result{url: u, err: e}
+	}()
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first link refresh")
+	}
+	go func() {
+		u, e := streamer.url(context.Background(), file, false)
+		results <- result{url: u, err: e}
+	}()
+	close(provider.release)
+	for i := 0; i < 2; i++ {
+		got := <-results
+		if got.err != nil || got.url != provider.url {
+			t.Fatalf("unexpected coalesced result: %#v", got)
+		}
+	}
+	provider.mu.Lock()
+	calls := provider.calls
+	provider.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected one provider link request, got %d", calls)
+	}
+}
+
+func TestStreamerDoesNotRetryRateLimitedLinkImmediately(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test"}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rateLimitedLinkProvider{}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, TTL: time.Hour}
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", recorder.Code)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("expected one provider request, got %d", provider.calls)
 	}
 }
 

@@ -39,3 +39,19 @@ func TestTorBoxClassifiesGatewayFailuresAsTransient(t *testing.T) {
 		})
 	}
 }
+
+func TestTorBoxClassifiesRateLimitsSeparately(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     http.StatusText(http.StatusTooManyRequests),
+			Body:       io.NopCloser(strings.NewReader(`{"detail":"rate limit exceeded"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	provider := &TorBox{Token: "token", Client: client}
+	_, err := provider.StreamURL(context.Background(), &model.File{ProviderItemID: "1", ProviderFileID: "2"})
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected rate-limit error, got %v", err)
+	}
+}

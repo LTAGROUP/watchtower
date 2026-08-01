@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	ErrStaleItem = errors.New("debrid item is no longer available")
-	ErrTransient = errors.New("temporary debrid failure")
+	ErrStaleItem   = errors.New("debrid item is no longer available")
+	ErrTransient   = errors.New("temporary debrid failure")
+	ErrRateLimited = errors.New("debrid provider rate limited")
 )
 
 type Provider interface {

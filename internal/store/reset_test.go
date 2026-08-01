@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -85,6 +86,47 @@ func TestOpenRepairsLegacyMediaIDs(t *testing.T) {
 	}
 	if reset.ID != 42 || reset.Status != "queued" {
 		t.Fatalf("repaired media could not be reset: %#v", reset)
+	}
+}
+
+func TestOpenCollapsesDuplicateMediaIdentityAndFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := model.State{
+		Media: map[int64]*model.Media{
+			11: {ID: 11, Type: "movie", TMDBID: 99, Title: "Example", Status: "ready"},
+			22: {ID: 22, Type: "movie", TMDBID: 99, Title: "Example", Status: "partial"},
+		},
+		Files: map[string]*model.File{
+			"one":   {ID: "one", MediaID: 11, Path: "Movies/Example/Example [1080p].mkv"},
+			"two":   {ID: "two", MediaID: 22, Path: "Movies/Example/Example [1080p].mkv"},
+			"three": {ID: "three", MediaID: 22, Path: "Movies/Example/Example [2160p].mkv"},
+		},
+		ProcessedRequests: map[int64]time.Time{},
+	}
+	b, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := s.Media()
+	if len(media) != 1 || media[0].Type != "movie" || media[0].TMDBID != 99 {
+		t.Fatalf("duplicate media identity was not collapsed: %#v", media)
+	}
+	files := s.Files()
+	if len(files) != 2 {
+		t.Fatalf("duplicate file path was not collapsed: %#v", files)
+	}
+	for _, file := range files {
+		if file.MediaID != media[0].ID {
+			t.Fatalf("file still points at duplicate media: %#v", file)
+		}
 	}
 }
 

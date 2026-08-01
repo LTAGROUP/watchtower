@@ -63,6 +63,9 @@ func Open(path string) (*Store, error) {
 			migrated = true
 		}
 	}
+	if s.deduplicateMediaLocked() {
+		migrated = true
+	}
 	if migrated {
 		if err := s.saveLocked(); err != nil {
 			return nil, fmt.Errorf("migrate state: %w", err)
@@ -92,10 +95,250 @@ func (s *Store) IsProcessed(id int64) bool {
 	return ok
 }
 func (s *Store) UpsertMedia(m *model.Media) error {
+	if m == nil {
+		return errors.New("media is required")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.mergeMediaIdentityLocked(m)
 	s.state.Media[m.ID] = m
 	return s.saveLocked()
+}
+
+func (s *Store) mergeMediaIdentityLocked(incoming *model.Media) {
+	if incoming.Type == "" || incoming.TMDBID <= 0 {
+		return
+	}
+	ids := []int64{incoming.ID}
+	for id, existing := range s.state.Media {
+		if id != incoming.ID && sameMediaIdentity(existing, incoming) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 1 {
+		return
+	}
+	canonical := s.bestMediaIDLocked(ids)
+	for _, id := range ids {
+		if existing := s.state.Media[id]; existing != nil && existing != incoming {
+			mergeMediaMetadata(incoming, existing)
+		}
+	}
+	incoming.ID = canonical
+	s.reassignMediaFilesLocked(canonical, ids)
+	for _, id := range ids {
+		if id != canonical {
+			delete(s.state.Media, id)
+		}
+	}
+}
+
+func (s *Store) deduplicateMediaLocked() bool {
+	groups := map[string][]int64{}
+	for id, media := range s.state.Media {
+		if key := mediaIdentityKey(media); key != "" {
+			groups[key] = append(groups[key], id)
+		}
+	}
+	changed := false
+	for _, ids := range groups {
+		if len(ids) < 2 {
+			continue
+		}
+		canonical := s.bestMediaIDLocked(ids)
+		primary := s.state.Media[canonical]
+		for _, id := range ids {
+			if id != canonical {
+				mergeMediaMetadata(primary, s.state.Media[id])
+			}
+		}
+		s.reassignMediaFilesLocked(canonical, ids)
+		for _, id := range ids {
+			if id != canonical {
+				delete(s.state.Media, id)
+			}
+		}
+		changed = true
+	}
+	return changed
+}
+
+func (s *Store) bestMediaIDLocked(ids []int64) int64 {
+	best := ids[0]
+	for _, id := range ids[1:] {
+		if s.mediaIDPreferredLocked(id, best) {
+			best = id
+		}
+	}
+	return best
+}
+
+func (s *Store) mediaIDPreferredLocked(candidate, current int64) bool {
+	candidateFiles, currentFiles := 0, 0
+	for _, file := range s.state.Files {
+		if file == nil {
+			continue
+		}
+		if file.MediaID == candidate {
+			candidateFiles++
+		}
+		if file.MediaID == current {
+			currentFiles++
+		}
+	}
+	if candidateFiles != currentFiles {
+		return candidateFiles > currentFiles
+	}
+	candidateStatus, currentStatus := "", ""
+	if media := s.state.Media[candidate]; media != nil {
+		candidateStatus = media.Status
+	}
+	if media := s.state.Media[current]; media != nil {
+		currentStatus = media.Status
+	}
+	if mediaStatusRank(candidateStatus) != mediaStatusRank(currentStatus) {
+		return mediaStatusRank(candidateStatus) > mediaStatusRank(currentStatus)
+	}
+	return candidate < current
+}
+
+func (s *Store) reassignMediaFilesLocked(canonical int64, ids []int64) {
+	owned := map[int64]bool{}
+	for _, id := range ids {
+		owned[id] = true
+	}
+	type fileRef struct {
+		id   string
+		file *model.File
+	}
+	refs := make([]fileRef, 0)
+	for id, file := range s.state.Files {
+		if file != nil && owned[file.MediaID] {
+			refs = append(refs, fileRef{id: id, file: file})
+		}
+	}
+	sort.SliceStable(refs, func(i, j int) bool {
+		iCanonical := refs[i].file.MediaID == canonical
+		jCanonical := refs[j].file.MediaID == canonical
+		if iCanonical != jCanonical {
+			return iCanonical
+		}
+		return refs[i].id < refs[j].id
+	})
+	paths := map[string]bool{}
+	for _, ref := range refs {
+		path := strings.Trim(ref.file.Path, "/")
+		if path != "" && paths[path] {
+			delete(s.state.Files, ref.id)
+			continue
+		}
+		if path != "" {
+			paths[path] = true
+		}
+		ref.file.MediaID = canonical
+	}
+}
+
+func sameMediaIdentity(a, b *model.Media) bool {
+	return mediaIdentityKey(a) != "" && mediaIdentityKey(a) == mediaIdentityKey(b)
+}
+
+func mediaIdentityKey(media *model.Media) string {
+	if media == nil || media.TMDBID <= 0 || strings.TrimSpace(media.Type) == "" {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(media.Type)) + ":" + fmt.Sprint(media.TMDBID)
+}
+
+func mergeMediaMetadata(dst, src *model.Media) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.Type == "" {
+		dst.Type = src.Type
+	}
+	if dst.TMDBID == 0 {
+		dst.TMDBID = src.TMDBID
+	}
+	if dst.ExternalID == "" {
+		dst.ExternalID = src.ExternalID
+	}
+	if dst.Title == "" {
+		dst.Title = src.Title
+	}
+	if dst.Year == 0 {
+		dst.Year = src.Year
+	}
+	if dst.Overview == "" {
+		dst.Overview = src.Overview
+	}
+	if dst.PosterPath == "" {
+		dst.PosterPath = src.PosterPath
+	}
+	if dst.BackdropPath == "" {
+		dst.BackdropPath = src.BackdropPath
+	}
+	if dst.ReleaseDate == "" {
+		dst.ReleaseDate = src.ReleaseDate
+	}
+	if dst.RequestID == 0 {
+		dst.RequestID = src.RequestID
+	}
+	if dst.Status == "" {
+		dst.Status = src.Status
+	}
+	if dst.Error == "" && dst.Status == "failed" {
+		dst.Error = src.Error
+	}
+	if dst.CreatedAt.IsZero() || (!src.CreatedAt.IsZero() && src.CreatedAt.Before(dst.CreatedAt)) {
+		dst.CreatedAt = src.CreatedAt
+	}
+	if src.UpdatedAt.After(dst.UpdatedAt) {
+		dst.UpdatedAt = src.UpdatedAt
+	}
+	if src.ScrapedAt.After(dst.ScrapedAt) {
+		dst.ScrapedAt = src.ScrapedAt
+	}
+	seenSeasons := map[int]bool{}
+	for _, season := range dst.Seasons {
+		seenSeasons[season] = true
+	}
+	for _, season := range src.Seasons {
+		if !seenSeasons[season] {
+			dst.Seasons = append(dst.Seasons, season)
+			seenSeasons[season] = true
+		}
+	}
+	sort.Ints(dst.Seasons)
+	if len(src.EpisodeCounts) > 0 {
+		if dst.EpisodeCounts == nil {
+			dst.EpisodeCounts = map[int]int{}
+		}
+		for season, count := range src.EpisodeCounts {
+			if dst.EpisodeCounts[season] == 0 || count > dst.EpisodeCounts[season] {
+				dst.EpisodeCounts[season] = count
+			}
+		}
+	}
+}
+
+func mediaStatusRank(status string) int {
+	switch status {
+	case "ready":
+		return 6
+	case "partial":
+		return 5
+	case "resolving":
+		return 4
+	case "scraping":
+		return 3
+	case "queued":
+		return 2
+	case "unreleased":
+		return 1
+	default:
+		return 0
+	}
 }
 func (s *Store) AddFiles(files ...*model.File) error {
 	s.mu.Lock()
