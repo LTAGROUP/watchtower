@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b0d12">
+  <meta name="theme-color" content="#101318">
   <title>WatchTower Console</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
@@ -11,7 +11,7 @@
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="#dashboard" aria-label="WatchTower dashboard">
-        <span class="brand-mark"><i></i></span>
+        <span class="brand-mark" aria-hidden="true">W</span>
         <span><strong>WatchTower</strong><small>Media operations</small></span>
       </a>
       <nav class="nav" aria-label="Main navigation">
@@ -46,9 +46,9 @@
       <section class="page active" id="dashboard-page">
         <div class="hero-panel">
           <div>
-            <span class="live-label"><i></i> Pipeline live</span>
-            <h2>Your media flow, at a glance.</h2>
-            <p>Track every title from discovery through scrape, resolution, and Plex-ready files.</p>
+            <span class="live-label"><i></i> System operational</span>
+            <h2>Media pipeline overview</h2>
+            <p>Monitor titles from discovery through resolution and delivery to Plex.</p>
           </div>
           <a href="#queue" class="text-link">Inspect active queue <span>→</span></a>
         </div>
@@ -70,7 +70,7 @@
 
       <section class="page" id="discover-page">
         <div class="section-intro">
-          <div><h2>Find something worth watching.</h2><p>Explore Seerr’s catalog, narrow the field, then send a request directly into your pipeline.</p></div>
+          <div><h2>Discover media</h2><p>Search the Seerr catalog, refine the results, and add a title to the pipeline.</p></div>
         </div>
         <form class="filter-bar" id="discover-form">
           <label class="search-field"><span>⌕</span><input id="discover-query" type="search" placeholder="Search titles, people, collections…" autocomplete="off"></label>
@@ -87,12 +87,19 @@
 
       <section class="page" id="library-page">
         <div class="section-intro row">
-          <div><h2>Your indexed library.</h2><p>Browse tracked titles or inspect the exact files exposed to Plex.</p></div>
+          <div><h2>Media library</h2><p>Browse tracked titles or inspect the files exposed to Plex.</p></div>
           <label class="compact-search"><span>⌕</span><input id="library-search" type="search" placeholder="Filter library"></label>
         </div>
-        <div class="tabs" role="tablist">
-          <button class="tab active" data-library-tab="media">Media <span id="media-tab-count">0</span></button>
-          <button class="tab" data-library-tab="files">Files <span id="files-tab-count">0</span></button>
+        <div class="view-controls">
+          <div class="tabs" role="tablist" aria-label="Library view">
+            <button class="tab active" type="button" role="tab" aria-selected="true" data-library-tab="media">Media <span id="media-tab-count">0</span></button>
+            <button class="tab" type="button" role="tab" aria-selected="false" data-library-tab="files">Files <span id="files-tab-count">0</span></button>
+          </div>
+          <div class="segmented-control" aria-label="Filter library by media type">
+            <button class="active" type="button" data-library-type="all" aria-pressed="true">All <span id="library-all-count">0</span></button>
+            <button type="button" data-library-type="movie" aria-pressed="false">Movies <span id="library-movie-count">0</span></button>
+            <button type="button" data-library-type="tv" aria-pressed="false">TV <span id="library-tv-count">0</span></button>
+          </div>
         </div>
         <div id="library-media-grid" class="poster-grid library-grid"></div>
         <div id="library-files-table" class="table-card" hidden>
@@ -101,14 +108,21 @@
       </section>
 
       <section class="page" id="queue-page">
-        <div class="section-intro row"><div><h2>Resolution queue.</h2><p>Active, partial, and failed work stays visible until it is ready.</p></div><button class="button ghost" id="retry-failed">Retry all failed</button></div>
+        <div class="section-intro row"><div><h2>Resolution queue</h2><p>Review active, partial, and failed work until each title is ready.</p></div><button class="button ghost" id="retry-failed">Retry all failed</button></div>
+        <div class="queue-toolbar">
+          <div class="segmented-control" aria-label="Filter queue by media type">
+            <button class="active" type="button" data-queue-type="all" aria-pressed="true">All <span id="queue-all-count">0</span></button>
+            <button type="button" data-queue-type="movie" aria-pressed="false">Movies <span id="queue-movie-count">0</span></button>
+            <button type="button" data-queue-type="tv" aria-pressed="false">TV <span id="queue-tv-count">0</span></button>
+          </div>
+        </div>
         <div class="queue-summary" id="queue-summary"></div>
         <div id="queue-list" class="queue-list"></div>
       </section>
 
       <section class="page" id="logs-page">
         <div class="section-intro">
-          <div><h2>Live service logs.</h2><p>Search and filter recent activity across the WatchTower pipeline without leaving the dashboard.</p></div>
+          <div><h2>Service logs</h2><p>Search and filter recent activity across the WatchTower pipeline.</p></div>
         </div>
         <div class="log-toolbar">
           <label class="search-field"><span>⌕</span><input id="log-search" type="search" placeholder="Search messages and fields…" autocomplete="off"></label>
@@ -130,7 +144,7 @@
       </section>
 
       <section class="page" id="settings-page">
-        <div class="section-intro"><div><h2>Runtime settings.</h2><p>Changes are saved in the data volume and take effect without rebuilding the container.</p></div></div>
+        <div class="section-intro"><div><h2>Runtime settings</h2><p>Changes are saved in the data volume and take effect without rebuilding the container.</p></div></div>
         <form id="settings-form" class="settings-layout">
           <article class="panel settings-section">
             <div class="panel-head"><div><p class="kicker">Connection</p><h3>Seerr</h3></div><span id="seerr-state" class="connection-pill">Checking</span></div>
@@ -149,13 +163,33 @@
               <label><span>Scan delay</span><input name="plexScanDelay" placeholder="45s"></label>
             </div>
           </article>
-          <article class="panel settings-section">
+          <article class="panel settings-section full">
             <div class="panel-head"><div><p class="kicker">Resolution</p><h3>Providers & quality</h3></div></div>
             <div class="field-grid">
-              <label class="wide"><span>Providers, in priority order</span><input name="providers" placeholder="torbox, alldebrid"></label>
+              <div class="wide choice-field">
+                <div class="field-label"><span>Active providers</span><small>Multiple providers can be enabled. Saved priority order is preserved.</small></div>
+                <div class="choice-grid" id="provider-options">
+                  <label class="choice-option" data-provider="torbox">
+                    <input name="providerOption" type="checkbox" value="torbox">
+                    <span class="choice-content"><span><strong>TorBox</strong><small>Debrid cache and direct downloads</small></span><b class="choice-state">Off</b></span>
+                  </label>
+                  <label class="choice-option" data-provider="alldebrid">
+                    <input name="providerOption" type="checkbox" value="alldebrid">
+                    <span class="choice-content"><span><strong>AllDebrid</strong><small>Alternate debrid resolution provider</small></span><b class="choice-state">Off</b></span>
+                  </label>
+                </div>
+              </div>
               <label><span>TorBox token</span><input name="torBoxToken" type="password" placeholder="Leave blank to keep current" autocomplete="new-password"></label>
               <label><span>AllDebrid token</span><input name="allDebridToken" type="password" placeholder="Leave blank to keep current" autocomplete="new-password"></label>
-              <label class="wide"><span>Qualities</span><input name="qualities" placeholder="2160p, 1080p"></label>
+              <div class="wide choice-field">
+                <div class="field-label"><span>Preferred qualities</span><small>WatchTower tries enabled qualities in the order shown.</small></div>
+                <div class="choice-grid quality-options" id="quality-options">
+                  <label class="choice-option" data-quality="2160p"><input name="qualityOption" type="checkbox" value="2160p"><span class="choice-content"><span><strong>2160p</strong><small>Ultra HD</small></span><b class="choice-state">Off</b></span></label>
+                  <label class="choice-option" data-quality="1080p"><input name="qualityOption" type="checkbox" value="1080p"><span class="choice-content"><span><strong>1080p</strong><small>Full HD</small></span><b class="choice-state">Off</b></span></label>
+                  <label class="choice-option" data-quality="720p"><input name="qualityOption" type="checkbox" value="720p"><span class="choice-content"><span><strong>720p</strong><small>HD</small></span><b class="choice-state">Off</b></span></label>
+                  <label class="choice-option" data-quality="480p"><input name="qualityOption" type="checkbox" value="480p"><span class="choice-content"><span><strong>480p</strong><small>Standard definition</small></span><b class="choice-state">Off</b></span></label>
+                </div>
+              </div>
               <label><span>Minimum seeders</span><input name="minSeeders" type="number" min="0"></label>
               <label><span>Results per quality</span><input name="maxResults" type="number" min="1" max="500"></label>
               <label><span>Stream URL TTL</span><input name="streamUrlTtl" placeholder="45m"></label>

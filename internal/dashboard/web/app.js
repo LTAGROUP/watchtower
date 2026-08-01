@@ -1,6 +1,6 @@
 const state = {
   route: 'dashboard', summary: null, media: [], files: [], queue: [], settings: null,
-  libraryTab: 'media', detailCache: new Map(), detail: null,
+  libraryTab: 'media', libraryType: 'all', queueType: 'all', detailCache: new Map(), detail: null,
   discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true },
   logs: { entries: [], capacity: 0, loading: false }
 };
@@ -66,12 +66,12 @@ function renderDashboard() {
   if (!state.summary) return;
   const s = state.summary;
   const metrics = [
-    ['Indexed titles', s.indexed, 'Titles tracked by WatchTower', '◆'],
-    ['Scraped', s.scraped, 'Catalog searches completed', '⌁'],
-    ['Plex files', s.files, formatBytes(s.bytes), '▦'],
-    ['Ready', s.statuses?.ready || 0, `${s.statuses?.unreleased || 0} unreleased · ${s.statuses?.failed || 0} failed`, '✓']
+    ['Indexed titles', s.indexed, 'Titles tracked by WatchTower'],
+    ['Scraped', s.scraped, 'Catalog searches completed'],
+    ['Plex files', s.files, formatBytes(s.bytes)],
+    ['Ready', s.statuses?.ready || 0, `${s.statuses?.unreleased || 0} unreleased · ${s.statuses?.failed || 0} failed`]
   ];
-  $('#metric-grid').innerHTML = metrics.map(item => `<article class="metric-card"><span class="metric-label">${escapeHTML(item[0])}</span><strong class="metric-value">${Number(item[1]).toLocaleString()}</strong><span class="metric-note">${escapeHTML(item[2])}</span><span class="metric-accent">${item[3]}</span></article>`).join('');
+  $('#metric-grid').innerHTML = metrics.map(item => `<article class="metric-card"><span class="metric-label">${escapeHTML(item[0])}</span><strong class="metric-value">${Number(item[1]).toLocaleString()}</strong><span class="metric-note">${escapeHTML(item[2])}</span></article>`).join('');
   const statuses = ['queued','unreleased','scraping','resolving','ready','partial','failed'];
   const total = Math.max(1, statuses.reduce((sum, key) => sum + (s.statuses?.[key] || 0), 0));
   $('#pipeline-total').textContent = `${s.indexed} tracked`;
@@ -82,21 +82,28 @@ function renderDashboard() {
 }
 
 function renderLibrary() {
-  $('#media-tab-count').textContent = state.media.length;
-  $('#files-tab-count').textContent = state.files.length;
+  const type = state.libraryType;
+  const typedMedia = state.media.filter(item => type === 'all' || item.type === type);
+  const typedMediaIDs = new Set(typedMedia.map(item => Number(item.id)));
+  const typedFiles = state.files.filter(file => type === 'all' || typedMediaIDs.has(Number(file.mediaId)) || mediaTypeForFile(file) === type);
+  $('#library-all-count').textContent = state.media.length;
+  $('#library-movie-count').textContent = state.media.filter(item => item.type === 'movie').length;
+  $('#library-tv-count').textContent = state.media.filter(item => item.type === 'tv').length;
+  $('#media-tab-count').textContent = typedMedia.length;
+  $('#files-tab-count').textContent = typedFiles.length;
   const query = ($('#library-search')?.value || '').trim().toLowerCase();
   const isMedia = state.libraryTab === 'media';
   $('#library-media-grid').hidden = !isMedia;
   $('#library-files-table').hidden = isMedia;
   if (isMedia) {
-    const items = [...state.media].sort((a,b) => String(a.title).localeCompare(String(b.title))).filter(item => `${item.title} ${item.year} ${item.status}`.toLowerCase().includes(query));
-    $('#library-media-grid').innerHTML = items.length ? items.map(libraryCard).join('') : '<div class="panel empty-state">No media matches this filter.</div>';
+    const items = [...typedMedia].sort((a,b) => String(a.title).localeCompare(String(b.title))).filter(item => `${item.title} ${item.year} ${item.status}`.toLowerCase().includes(query));
+    $('#library-media-grid').innerHTML = items.length ? items.map(libraryCard).join('') : '<div class="panel empty-state">No titles match these filters.</div>';
     bindImageFallbacks($('#library-media-grid'));
     return;
   }
   $('#library-head').innerHTML = '<tr><th>File path</th><th>Quality</th><th>Provider</th><th>Size</th><th>Added</th></tr>';
-  const rows = [...state.files].sort(compareEpisodeFiles).filter(file => `${file.path} ${file.quality} ${file.provider}`.toLowerCase().includes(query));
-  $('#library-body').innerHTML = rows.length ? rows.map(file => `<tr><td><strong>${escapeHTML(lastPath(file.path))}</strong><span class="cell-sub" title="${escapeHTML(file.path)}">${escapeHTML(file.path)}</span></td><td>${escapeHTML(file.quality)}</td><td>${escapeHTML(file.provider)}</td><td>${formatBytes(file.size)}</td><td>${timeAgo(file.createdAt)}</td></tr>`).join('') : emptyRow(5, 'No files match this filter.');
+  const rows = [...typedFiles].sort(compareEpisodeFiles).filter(file => `${file.path} ${file.quality} ${file.provider}`.toLowerCase().includes(query));
+  $('#library-body').innerHTML = rows.length ? rows.map(file => `<tr><td><strong>${escapeHTML(lastPath(file.path))}</strong><span class="cell-sub" title="${escapeHTML(file.path)}">${escapeHTML(file.path)}</span></td><td>${escapeHTML(file.quality)}</td><td>${escapeHTML(file.provider)}</td><td>${formatBytes(file.size)}</td><td>${timeAgo(file.createdAt)}</td></tr>`).join('') : emptyRow(5, 'No files match these filters.');
 }
 
 function libraryCard(item) {
@@ -106,11 +113,15 @@ function libraryCard(item) {
 }
 
 function renderQueue() {
+  $('#queue-all-count').textContent = state.queue.length;
+  $('#queue-movie-count').textContent = state.queue.filter(item => item.type === 'movie').length;
+  $('#queue-tv-count').textContent = state.queue.filter(item => item.type === 'tv').length;
+  const filteredQueue = state.queue.filter(item => state.queueType === 'all' || item.type === state.queueType);
   const counts = {active:0, unreleased:0, partial:0, failed:0};
-  state.queue.forEach(item => { if (['queued','scraping','resolving'].includes(item.status)) counts.active++; if (item.status === 'unreleased') counts.unreleased++; if (item.status === 'partial') counts.partial++; if (item.status === 'failed') counts.failed++; });
+  filteredQueue.forEach(item => { if (['queued','scraping','resolving'].includes(item.status)) counts.active++; if (item.status === 'unreleased') counts.unreleased++; if (item.status === 'partial') counts.partial++; if (item.status === 'failed') counts.failed++; });
   $('#queue-summary').innerHTML = [['Active',counts.active],['Unreleased',counts.unreleased],['Partial',counts.partial],['Failed',counts.failed]].map(([label,value]) => `<div class="queue-stat"><strong>${value}</strong><small>${label}</small></div>`).join('');
-  const list = [...state.queue].sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-  $('#queue-list').innerHTML = list.length ? list.map(item => `<article class="queue-card"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><h3>${escapeHTML(item.title)} ${item.year ? `<span class="muted">(${item.year})</span>` : ''}</h3><p>${item.status === 'unreleased' && item.releaseDate ? `Releases ${formatDate(item.releaseDate)} · WatchTower will retry automatically` : item.error ? escapeHTML(item.error) : `${item.seasons?.length ? `Seasons ${item.seasons.join(', ')} · ` : ''}updated ${timeAgo(item.updatedAt)}`}</p></div><div class="queue-actions"><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span>${item.status === 'unreleased' ? '' : `<button class="button ghost" data-reset-id="${item.id}">Retry</button>`}</div></article>`).join('') : '<div class="panel empty-state">The queue is clear. Everything tracked is ready.</div>';
+  const list = [...filteredQueue].sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  $('#queue-list').innerHTML = list.length ? list.map(item => `<article class="queue-card"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><h3>${escapeHTML(item.title)} ${item.year ? `<span class="muted">(${item.year})</span>` : ''}</h3><p>${item.status === 'unreleased' && item.releaseDate ? `Releases ${formatDate(item.releaseDate)} · WatchTower will retry automatically` : item.error ? escapeHTML(item.error) : `${item.seasons?.length ? `Seasons ${item.seasons.join(', ')} · ` : ''}updated ${timeAgo(item.updatedAt)}`}</p></div><div class="queue-actions"><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span>${item.status === 'unreleased' ? '' : `<button class="button ghost" data-reset-id="${item.id}">Retry</button>`}</div></article>`).join('') : '<div class="panel empty-state">No queue items match this media type.</div>';
 }
 
 async function loadLogs() {
@@ -391,8 +402,9 @@ async function loadSettings() {
     form.elements.seerrUrl.value = s.seerrUrl || '';
     form.elements.plexUrl.value = s.plexUrl || '';
     form.elements.plexScanDelay.value = s.plexScanDelay || '45s';
-    form.elements.providers.value = (s.providers || []).join(', ');
-    form.elements.qualities.value = (s.qualities || []).join(', ');
+    syncChoiceGroup($('#provider-options'), s.providers || [], 'provider');
+    ensureQualityOptions(s.qualities || []);
+    syncChoiceGroup($('#quality-options'), s.qualities || [], 'quality');
     form.elements.pollInterval.value = s.pollInterval || '';
     form.elements.resolveTimeout.value = s.resolveTimeout || '';
     form.elements.streamUrlTtl.value = s.streamUrlTtl || '';
@@ -411,7 +423,13 @@ async function saveSettings(event) {
   event.preventDefault();
   const form = event.currentTarget; const submit = form.querySelector('[type=submit]');
   const split = value => value.split(/[,\n]/).map(v => v.trim()).filter(Boolean);
-  const payload = {seerrUrl:form.elements.seerrUrl.value.trim(), plexUrl:form.elements.plexUrl.value.trim(), plexScanDelay:form.elements.plexScanDelay.value.trim(), providers:split(form.elements.providers.value), qualities:split(form.elements.qualities.value), stremioAddons:split(form.elements.stremioAddons.value), pollInterval:form.elements.pollInterval.value.trim(), resolveTimeout:form.elements.resolveTimeout.value.trim(), streamUrlTtl:form.elements.streamUrlTtl.value.trim(), minSeeders:Number(form.elements.minSeeders.value), maxResults:Number(form.elements.maxResults.value), allowUncached:form.elements.allowUncached.checked};
+  const providers = checkedChoiceValues($('#provider-options'));
+  const qualities = checkedChoiceValues($('#quality-options'));
+  if (!providers.length || !qualities.length) {
+    showNotice(`Choose at least one ${providers.length ? 'quality' : 'provider'}.`, true);
+    return;
+  }
+  const payload = {seerrUrl:form.elements.seerrUrl.value.trim(), plexUrl:form.elements.plexUrl.value.trim(), plexScanDelay:form.elements.plexScanDelay.value.trim(), providers, qualities, stremioAddons:split(form.elements.stremioAddons.value), pollInterval:form.elements.pollInterval.value.trim(), resolveTimeout:form.elements.resolveTimeout.value.trim(), streamUrlTtl:form.elements.streamUrlTtl.value.trim(), minSeeders:Number(form.elements.minSeeders.value), maxResults:Number(form.elements.maxResults.value), allowUncached:form.elements.allowUncached.checked};
   ['seerrApiKey','plexToken','torBoxToken','allDebridToken'].forEach(name => { if (form.elements[name].value.trim()) payload[name] = form.elements[name].value.trim(); });
   submit.disabled = true;
   try {
@@ -421,6 +439,43 @@ async function saveSettings(event) {
     showNotice('Settings saved and applied.'); await loadSettings();
   } catch (error) { showNotice(error.message, true); }
   finally { submit.disabled = false; }
+}
+
+function ensureQualityOptions(qualities) {
+  const container = $('#quality-options');
+  qualities.forEach(quality => {
+    if ($$('.choice-option', container).some(option => option.dataset.quality === quality)) return;
+    const label = document.createElement('label');
+    label.className = 'choice-option';
+    label.dataset.quality = quality;
+    label.innerHTML = `<input name="qualityOption" type="checkbox" value="${escapeHTML(quality)}"><span class="choice-content"><span><strong>${escapeHTML(quality)}</strong><small>Custom quality</small></span><b class="choice-state">Off</b></span>`;
+    container.append(label);
+  });
+}
+
+function syncChoiceGroup(container, selected, dataKey) {
+  const positions = new Map(selected.map((value, index) => [value, index]));
+  const options = $$('.choice-option', container).sort((left, right) => {
+    const leftPosition = positions.has(left.dataset[dataKey]) ? positions.get(left.dataset[dataKey]) : selected.length + [...container.children].indexOf(left);
+    const rightPosition = positions.has(right.dataset[dataKey]) ? positions.get(right.dataset[dataKey]) : selected.length + [...container.children].indexOf(right);
+    return leftPosition - rightPosition;
+  });
+  options.forEach(option => {
+    container.append(option);
+    const input = $('input[type="checkbox"]', option);
+    input.checked = selected.includes(input.value);
+    updateChoiceOption(input);
+  });
+}
+
+function checkedChoiceValues(container) {
+  return $$('input[type="checkbox"]:checked', container).map(input => input.value);
+}
+
+function updateChoiceOption(input) {
+  const option = input.closest('.choice-option');
+  option.classList.toggle('selected', input.checked);
+  $('.choice-state', option).textContent = input.checked ? 'On' : 'Off';
 }
 
 function updateGenres() {
@@ -435,6 +490,7 @@ function bindImageFallbacks(root) {
 }
 function isInLibrary(type, tmdbID) { return state.media.some(item => item.type === type && Number(item.tmdbId) === Number(tmdbID)); }
 function filesFor(mediaId) { return state.files.filter(file => Number(file.mediaId) === Number(mediaId)); }
+function mediaTypeForFile(file) { const media = state.media.find(item => Number(item.id) === Number(file.mediaId)); if (media?.type) return media.type; return /^TV\//i.test(file.path || '') ? 'tv' : /^Movies\//i.test(file.path || '') ? 'movie' : ''; }
 function episodeRef(path = '') { const match = String(path).match(/S(\d{1,2})E(\d{1,3})/i); return match ? {season:Number(match[1]), episode:Number(match[2])} : null; }
 function episodeKeys(files, season = null) { const keys = new Set(); files.forEach(file => { const ref = episodeRef(file.path); if (ref && (season == null || ref.season === Number(season))) keys.add(`${ref.season}:${ref.episode}`); }); return keys; }
 function episodeProgress(item) { const owned = episodeKeys(filesFor(item.id)).size; const counts = item.episodeCounts || {}; const selected = (item.seasons || []).map(Number); const total = (selected.length ? selected : Object.keys(counts).map(Number)).reduce((sum, season) => sum + Number(counts[season] || 0), 0); return total > 0 ? `${owned} of ${total} episodes` : `${owned} episode${owned === 1 ? '' : 's'}`; }
@@ -457,8 +513,11 @@ $('#log-level').addEventListener('change', renderLogs);
 $('#log-component').addEventListener('change', renderLogs);
 $('#log-sort').addEventListener('change', renderLogs);
 $('#log-refresh').addEventListener('click', loadLogs);
-$$('[data-library-tab]').forEach(tab => tab.addEventListener('click', () => { state.libraryTab = tab.dataset.libraryTab; $$('[data-library-tab]').forEach(t => t.classList.toggle('active', t === tab)); renderLibrary(); }));
+$$('[data-library-tab]').forEach(tab => tab.addEventListener('click', () => { state.libraryTab = tab.dataset.libraryTab; $$('[data-library-tab]').forEach(t => { t.classList.toggle('active', t === tab); t.setAttribute('aria-selected', String(t === tab)); }); renderLibrary(); }));
+$$('[data-library-type]').forEach(button => button.addEventListener('click', () => { state.libraryType = button.dataset.libraryType; $$('[data-library-type]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', String(item === button)); }); renderLibrary(); }));
+$$('[data-queue-type]').forEach(button => button.addEventListener('click', () => { state.queueType = button.dataset.queueType; $$('[data-queue-type]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', String(item === button)); }); renderQueue(); }));
 $('#settings-form').addEventListener('submit', saveSettings);
+$('#settings-form').addEventListener('change', event => { if (event.target.matches('.choice-option input[type="checkbox"]')) updateChoiceOption(event.target); });
 $('#request-form').addEventListener('submit', submitRequest);
 $('#select-all-seasons').addEventListener('click', event => {
   const boxes = $$('input[type="checkbox"]', $('#season-options'));
