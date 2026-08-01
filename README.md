@@ -8,7 +8,7 @@ This project is intended for media you are authorized to access. It does not byp
 
 - TorBox and AllDebrid provider adapters
 - direct aggregation of Torrentio, Comet, StremThru, and other Stremio-compatible scraper endpoints
-- automatic polling of approved Seerr movie and TV requests
+- webhook-triggered imports of approved Seerr movie and TV requests with polling fallback
 - release-date awareness that parks future movies and TV seasons as `unreleased` instead of repeatedly scraping them
 - direct WatchTower requests from the dashboard without creating a Seerr request
 - independent 2160p and 1080p release selection
@@ -27,7 +27,7 @@ This project is intended for media you are authorized to access. It does not byp
 
 ```text
 Seerr catalog ----> WatchTower dashboard request ----> scraper addons ----> TorBox / AllDebrid
-Seerr request ----> WatchTower poller -----------------------^                    |
+Seerr request ----webhook----> WatchTower wake -> poller -------^                    |
 Plex <------------ host mount <---- rclone <---- WebDAV/Range proxy <-------------+
 ```
 
@@ -84,6 +84,17 @@ Plex sees the quality variants as multiple files for one movie or episode and ca
    approved Seerr requests can still be imported by the poller. If you use that
    legacy path, configure working Radarr/Sonarr service entries with automatic
    searching disabled (`preventSearch`) to avoid a second download workflow.
+
+8. To import Seerr requests immediately, open **Settings → Notifications → Webhook** in Seerr and configure:
+
+   - URL: `http://watchtower:8080/webhooks/seerr` when Seerr runs on the Compose network; use a reachable reverse-proxy URL for a remote Seerr instance.
+   - JSON Payload: `{"notification_type":"{{notification_type}}"}`
+   - Enable the **Request Approved** and **Request Automatically Approved** events.
+
+   The webhook is only a wake-up signal; WatchTower reads the approved request
+   from Seerr itself, so the regular poll remains the recovery path if a webhook
+   is missed. No Authorization header is required. Seerr webhook configuration
+   supports custom JSON payloads; see the [official webhook documentation](https://docs.seerr.dev/using-seerr/notifications/webhook/).
 
 Check operation with:
 
@@ -154,4 +165,4 @@ docker build -t watchtower .
 docker compose config
 ```
 
-Useful core endpoints inside the Compose network are `GET /healthz`, `GET /api/v1/library`, `PROPFIND /dav/`, and `POST /webhooks/seerr`. The Basic-authenticated dashboard and its control API are published on port 3001. Polling is authoritative; the webhook endpoint is available as a lightweight authenticated wake-up target for a later event-driven implementation.
+Useful core endpoints inside the Compose network are `GET /healthz`, `GET /api/v1/library`, `PROPFIND /dav/`, and `POST /webhooks/seerr`. The Basic-authenticated dashboard and its control API are published on port 3001. Polling remains authoritative, while the webhook provides immediate wake-ups for approved Seerr requests.

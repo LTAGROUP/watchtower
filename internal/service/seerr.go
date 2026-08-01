@@ -27,6 +27,8 @@ type Seerr struct {
 	Log             *slog.Logger
 	inflight        sync.Map
 	releaseInflight sync.Map
+	wakeOnce        sync.Once
+	wake            chan struct{}
 }
 type seerrPage struct {
 	Results []seerrRequest `json:"results"`
@@ -95,11 +97,52 @@ func (s *Seerr) Run(ctx context.Context) {
 		case <-ctx.Done():
 			t.Stop()
 			return
+		case <-s.wakeChannel():
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+			s.poll(ctx)
 		case <-t.C:
 			s.poll(ctx)
 		}
 	}
 }
+
+// Wake asks the Seerr importer to poll immediately. A buffered channel keeps
+// webhook delivery non-blocking and coalesces bursts of notifications.
+func (s *Seerr) Wake() {
+	select {
+	case s.wakeChannel() <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Seerr) wakeChannel() chan struct{} {
+	s.wakeOnce.Do(func() {
+		s.wake = make(chan struct{}, 1)
+	})
+	return s.wake
+}
+
+// WebhookHandler accepts Seerr notification webhooks without requiring an
+// authorization header and wakes the importer.
+// The body is intentionally not part of the import contract: polling Seerr
+// remains authoritative, so this also works with any valid Seerr webhook
+// payload and avoids coupling WatchTower to notification template changes.
+func (s *Seerr) WebhookHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+		s.Wake()
+		w.WriteHeader(http.StatusAccepted)
+	})
+}
+
 func (s *Seerr) poll(ctx context.Context) {
 	defer s.releaseDue(ctx)
 	cfg := s.currentConfig()

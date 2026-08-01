@@ -66,6 +66,7 @@ func main() {
 	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, LibraryChanged: plex.Notify, Log: log}
 	streamClient := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}, Timeout: 0}
 	streamer := &service.Streamer{Store: st, Settings: settings.Snapshot, ProviderFactory: providerFactory, Repair: resolver.Repair, Client: streamClient, TTL: cfg.StreamURLTTL, Log: log}
+	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Client: apiClient, Log: log}
 	mux := http.NewServeMux()
 	mux.Handle("/dav/", &dav.Handler{Store: st, Streamer: streamer, Prefix: "/dav"})
 	mux.Handle("/dav", &dav.Handler{Store: st, Streamer: streamer, Prefix: "/dav"})
@@ -76,17 +77,10 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"media": st.Media(), "files": st.Files()})
 	})
-	mux.HandleFunc("POST /webhooks/seerr", func(w http.ResponseWriter, r *http.Request) {
-		if cfg.WebhookSecret != "" && r.Header.Get("Authorization") != "Bearer "+cfg.WebhookSecret {
-			http.Error(w, "unauthorized", 401)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-	})
+	mux.Handle("/webhooks/seerr", seerr.WebhookHandler())
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: requestLog(log, mux), ReadHeaderTimeout: 10 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Client: apiClient, Log: log}
 	go seerr.Run(ctx)
 	go plex.Run(ctx)
 	dashboardHandler := (&dashboard.Handler{Store: st, Settings: settings, Resolver: resolver, Seerr: seerr, Username: cfg.DashboardUsername, Password: cfg.DashboardPassword, Log: log, Logs: logs}).Routes()

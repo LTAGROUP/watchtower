@@ -11,7 +11,7 @@ type Config struct {
 	ListenAddr, DataFile                       string
 	DashboardAddr, DashboardUsername           string
 	DashboardPassword, SettingsFile            string
-	PublicBaseURL, WebhookSecret               string
+	PublicBaseURL                              string
 	SeerrURL, SeerrAPIKey                      string
 	PlexURL, PlexToken                         string
 	TorBoxToken, AllDebridToken                string
@@ -29,7 +29,6 @@ func Load() Config {
 		DashboardAddr: env("DASHBOARD_ADDR", ":3001"), DashboardUsername: env("DASHBOARD_USERNAME", "admin"),
 		DashboardPassword: env("DASHBOARD_PASSWORD", "watchtower"), SettingsFile: env("SETTINGS_FILE", "/data/settings.json"),
 		PublicBaseURL: strings.TrimRight(env("PUBLIC_BASE_URL", "http://watchtower:8080"), "/"),
-		WebhookSecret: os.Getenv("WEBHOOK_SECRET"),
 		SeerrURL:      strings.TrimRight(os.Getenv("SEERR_URL"), "/"), SeerrAPIKey: os.Getenv("SEERR_API_KEY"),
 		PlexURL: strings.TrimRight(os.Getenv("PLEX_URL"), "/"), PlexToken: os.Getenv("PLEX_TOKEN"),
 		TorBoxToken: os.Getenv("TORBOX_TOKEN"), AllDebridToken: os.Getenv("ALLDEBRID_TOKEN"),
