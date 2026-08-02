@@ -115,3 +115,45 @@ func TestTorBoxGuardPacesRequestsAndSharesCooldown(t *testing.T) {
 		t.Fatalf("cooldown check blocked instead of failing fast")
 	}
 }
+
+func TestProviderGuardSharesProviderUnavailableCooldown(t *testing.T) {
+	guard := NewProviderGuard(time.Minute)
+	guard.Block(2 * time.Second)
+	started := time.Now()
+	err := guard.Wait(context.Background(), "alldebrid API")
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("expected provider unavailable error, got %v", err)
+	}
+	if time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("provider cooldown check blocked instead of failing fast")
+	}
+}
+
+func TestAllDebridClassifies503AndBlocksSharedGuard(t *testing.T) {
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Status:     http.StatusText(http.StatusServiceUnavailable),
+			Header:     http.Header{"Retry-After": []string{"7"}},
+			Body:       io.NopCloser(strings.NewReader("temporarily unavailable")),
+		}, nil
+	})}
+	guard := NewProviderGuard(time.Minute)
+	provider := &AllDebrid{Token: "token", Client: client, Guard: guard}
+	_, err := provider.StreamURL(context.Background(), &model.File{ProviderFileID: "file"})
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("expected provider unavailable error, got %v", err)
+	}
+	if delay, ok := ProviderCooldown(err); !ok || delay < 6*time.Second || delay > 7*time.Second {
+		t.Fatalf("expected Retry-After to be preserved, ok=%v delay=%s", ok, delay)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one API call, got %d", calls)
+	}
+	_, err = (&AllDebrid{Token: "token", Client: client, Guard: guard}).StreamURL(context.Background(), &model.File{ProviderFileID: "file"})
+	if !errors.Is(err, ErrProviderUnavailable) || calls != 1 {
+		t.Fatalf("expected shared cooldown to prevent second API call, calls=%d err=%v", calls, err)
+	}
+}

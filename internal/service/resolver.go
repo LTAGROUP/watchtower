@@ -43,6 +43,8 @@ type Resolver struct {
 	repairs               map[string]*repairCall
 	resolutionMu          sync.Mutex
 	resolutionSlots       chan struct{}
+	providerCooldownMu    sync.Mutex
+	providerCooldowns     map[string]time.Time
 }
 
 type repairCall struct {
@@ -101,6 +103,15 @@ func (r *Resolver) resolveUnbounded(ctx context.Context, m *model.Media, selecte
 	providers := r.Providers
 	if r.ProviderFactory != nil {
 		providers = r.ProviderFactory(cfg)
+	}
+	if delay, cooling := r.allProvidersCooling(cfg.Providers, providers); cooling {
+		m.Status = "queued"
+		m.Error = fmt.Sprintf("all providers cooling down; retry after %s", formatProviderCooldown(delay))
+		m.UpdatedAt = time.Now().UTC()
+		if r.Log != nil {
+			r.Log.Warn("media resolution deferred during provider cooldown", "component", "resolver", "title", m.Title, "retry_after", formatProviderCooldown(delay))
+		}
+		return r.Store.UpsertMedia(m)
 	}
 	started := time.Now()
 	if r.Log != nil {
@@ -163,6 +174,7 @@ func (r *Resolver) resolveUnbounded(ctx context.Context, m *model.Media, selecte
 		}
 	}
 	rateLimitedProviders := map[string]bool{}
+	deferred := false
 jobLoop:
 	for _, work := range jobs {
 		q := work.quality
@@ -215,7 +227,7 @@ jobLoop:
 		found := false
 		for _, rel := range rels {
 			for _, name := range cfg.Providers {
-				if rateLimitedProviders[name] {
+				if rateLimitedProviders[name] || r.providerCooling(name) {
 					continue
 				}
 				p := providers[name]
@@ -230,8 +242,9 @@ jobLoop:
 				resolved, e := p.Resolve(attempt, rel)
 				cancel()
 				if e != nil {
-					if errors.Is(e, debrid.ErrRateLimited) {
+					if delay, cooldown := debrid.ProviderCooldown(e); cooldown {
 						rateLimitedProviders[name] = true
+						r.markProviderCooldown(name, delay)
 					}
 					if r.Log != nil {
 						r.Log.Warn("provider resolution failed", "component", "resolver", "title", m.Title, "target", label, "provider", p.Name(), "source", rel.Source, "duration", time.Since(attemptStarted).String(), "error", e)
@@ -274,6 +287,13 @@ jobLoop:
 			}
 		}
 		if !found {
+			if delay, cooling := r.allProvidersCooling(cfg.Providers, providers); cooling {
+				deferred = true
+				if r.Log != nil {
+					r.Log.Warn("remaining media resolution deferred during provider cooldown", "component", "resolver", "title", m.Title, "retry_after", formatProviderCooldown(delay))
+				}
+				break jobLoop
+			}
 			errs = append(errs, label+": no acceptable cached release")
 		}
 	}
@@ -284,7 +304,14 @@ jobLoop:
 			completed++
 		}
 	}
-	if len(jobs) > 0 && completed == len(jobs) {
+	if deferred {
+		m.Status = "queued"
+		if delay, cooling := r.allProvidersCooling(cfg.Providers, providers); cooling {
+			m.Error = fmt.Sprintf("all providers cooling down; retry after %s", formatProviderCooldown(delay))
+		} else {
+			m.Error = "provider cooldown active; retry later"
+		}
+	} else if len(jobs) > 0 && completed == len(jobs) {
 		m.Status = "ready"
 		m.Error = ""
 	} else if completed == 0 {
@@ -444,6 +471,9 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 	if r.ProviderFactory != nil {
 		providers = r.ProviderFactory(cfg)
 	}
+	if delay, cooling := r.allProvidersCooling(cfg.Providers, providers); cooling {
+		return nil, fmt.Errorf("all providers cooling down; retry after %s", formatProviderCooldown(delay))
+	}
 	season := 0
 	episode := 0
 	if match := episodeRE.FindStringSubmatch(stale.Path); len(match) == 3 {
@@ -481,7 +511,7 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 	rateLimitedProviders := map[string]bool{}
 	for _, release := range releases {
 		for _, name := range providerOrder {
-			if rateLimitedProviders[name] {
+			if rateLimitedProviders[name] || r.providerCooling(name) {
 				continue
 			}
 			provider := providers[name]
@@ -492,8 +522,9 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 			resolved, resolveErr := provider.Resolve(attempt, release)
 			cancel()
 			if resolveErr != nil {
-				if errors.Is(resolveErr, debrid.ErrRateLimited) {
+				if delay, cooldown := debrid.ProviderCooldown(resolveErr); cooldown {
 					rateLimitedProviders[name] = true
+					r.markProviderCooldown(name, delay)
 				}
 				continue
 			}
@@ -517,6 +548,73 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 		}
 	}
 	return nil, fmt.Errorf("no replacement cached release found for %s", stale.Path)
+}
+
+func (r *Resolver) providerCooling(name string) bool {
+	r.providerCooldownMu.Lock()
+	defer r.providerCooldownMu.Unlock()
+	if r.providerCooldowns == nil {
+		return false
+	}
+	until := r.providerCooldowns[name]
+	if until.IsZero() {
+		return false
+	}
+	if !time.Now().Before(until) {
+		delete(r.providerCooldowns, name)
+		return false
+	}
+	return true
+}
+
+func (r *Resolver) markProviderCooldown(name string, delay time.Duration) {
+	if delay <= 0 {
+		delay = time.Minute
+	}
+	until := time.Now().Add(delay)
+	r.providerCooldownMu.Lock()
+	if r.providerCooldowns == nil {
+		r.providerCooldowns = map[string]time.Time{}
+	}
+	if until.After(r.providerCooldowns[name]) {
+		r.providerCooldowns[name] = until
+	}
+	r.providerCooldownMu.Unlock()
+}
+
+func (r *Resolver) allProvidersCooling(names []string, providers map[string]debrid.Provider) (time.Duration, bool) {
+	available := 0
+	longest := time.Duration(0)
+	for _, name := range names {
+		if providers[name] == nil {
+			continue
+		}
+		available++
+		r.providerCooldownMu.Lock()
+		until := time.Time{}
+		if r.providerCooldowns != nil {
+			until = r.providerCooldowns[name]
+		}
+		if !until.IsZero() && !time.Now().Before(until) {
+			delete(r.providerCooldowns, name)
+			until = time.Time{}
+		}
+		r.providerCooldownMu.Unlock()
+		if until.IsZero() {
+			return 0, false
+		}
+		if delay := time.Until(until); delay > longest {
+			longest = delay
+		}
+	}
+	return longest, available > 0
+}
+
+func formatProviderCooldown(delay time.Duration) string {
+	if rounded := delay.Round(time.Second); rounded > 0 {
+		return rounded.String()
+	}
+	return delay.String()
 }
 
 func moveFirst(values []string, wanted string) []string {

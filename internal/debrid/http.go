@@ -20,13 +20,23 @@ func doForm(ctx context.Context, c *http.Client, method, endpoint, token string,
 	if err != nil {
 		return nil, err
 	}
+	return decodeAPIResponse(resp, "alldebrid")
+}
+
+func decodeAPIResponse(resp *http.Response, provider string) (map[string]any, error) {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, NewRateLimitError(provider+" API", retryAfter(resp.Header.Get("Retry-After")), strings.TrimSpace(string(b)))
+	}
+	if resp.StatusCode >= 500 {
+		return nil, NewProviderUnavailableError(provider+" API", retryAfter(resp.Header.Get("Retry-After")), strings.TrimSpace(string(b)))
+	}
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("debrid API %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var out map[string]any
-	if err = json.Unmarshal(b, &out); err != nil {
+	if err := json.Unmarshal(b, &out); err != nil {
 		return nil, err
 	}
 	if ok, exists := out["success"].(bool); exists && !ok {

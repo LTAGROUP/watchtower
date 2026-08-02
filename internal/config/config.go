@@ -8,22 +8,23 @@ import (
 )
 
 type Config struct {
-	ListenAddr, DataFile                           string
-	DashboardAddr, DashboardUsername               string
-	DashboardPassword, SettingsFile                string
-	PublicBaseURL                                  string
-	SeerrURL, SeerrAPIKey                          string
-	PlexURL, PlexToken                             string
-	TorBoxToken, AllDebridToken                    string
-	Providers, Qualities, StremioAddons            []string
-	PollInterval, ResolveTimeout, StreamURLTTL     time.Duration
-	PlexScanDelay                                  time.Duration
-	TorBoxRequestInterval, TorBoxRateLimitCooldown time.Duration
-	TorBoxUncachedCreateInterval                   time.Duration
-	ResolutionConcurrency                          int
-	MinSeeders                                     int
-	MaxResults                                     int
-	AllowUncached                                  bool
+	ListenAddr, DataFile                                string
+	DashboardAddr, DashboardUsername                    string
+	DashboardPassword, SettingsFile                     string
+	PublicBaseURL                                       string
+	SeerrURL, SeerrAPIKey                               string
+	PlexURL, PlexToken                                  string
+	TorBoxToken, AllDebridToken                         string
+	Providers, Qualities, StremioAddons                 []string
+	PollInterval, ResolveTimeout, StreamURLTTL          time.Duration
+	PlexScanDelay                                       time.Duration
+	TorBoxRequestInterval, TorBoxRateLimitCooldown      time.Duration
+	TorBoxUncachedCreateInterval                        time.Duration
+	AllDebridProviderCooldown, ScraperRateLimitCooldown time.Duration
+	ResolutionConcurrency                               int
+	MinSeeders                                          int
+	MaxResults                                          int
+	AllowUncached                                       bool
 }
 
 func Load() Config {
@@ -41,6 +42,8 @@ func Load() Config {
 		StreamURLTTL: duration("STREAM_URL_TTL", 45*time.Minute), PlexScanDelay: duration("PLEX_SCAN_DELAY", 45*time.Second), MinSeeders: integer("MIN_SEEDERS", 0),
 		TorBoxRequestInterval: duration("TORBOX_REQUEST_INTERVAL", 250*time.Millisecond), TorBoxRateLimitCooldown: duration("TORBOX_RATE_LIMIT_COOLDOWN", time.Minute),
 		TorBoxUncachedCreateInterval: duration("TORBOX_UNCACHED_CREATE_INTERVAL", time.Minute),
+		AllDebridProviderCooldown:    duration("ALLDEBRID_PROVIDER_COOLDOWN", time.Minute),
+		ScraperRateLimitCooldown:     duration("SCRAPER_RATE_LIMIT_COOLDOWN", 2*time.Second),
 		ResolutionConcurrency:        integer("RESOLUTION_CONCURRENCY", 2),
 		MaxResults:                   integer("MAX_RESULTS_PER_QUALITY", 20), AllowUncached: boolean("ALLOW_UNCACHED", false),
 	}

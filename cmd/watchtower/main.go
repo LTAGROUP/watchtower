@@ -46,13 +46,15 @@ func main() {
 	}
 	apiClient := &http.Client{Timeout: 30 * time.Second}
 	torboxGuard := debrid.NewTorBoxGuard(cfg.TorBoxRequestInterval, cfg.TorBoxRateLimitCooldown, cfg.TorBoxUncachedCreateInterval)
+	alldebridGuard := debrid.NewProviderGuard(cfg.AllDebridProviderCooldown)
+	scraperGuard := scraper.NewRateLimitGuard(cfg.ScraperRateLimitCooldown)
 	providerFactory := func(current config.Config) map[string]debrid.Provider {
 		providers := map[string]debrid.Provider{}
 		if current.TorBoxToken != "" {
 			providers["torbox"] = &debrid.TorBox{Token: current.TorBoxToken, Client: apiClient, AllowUncached: current.AllowUncached, Guard: torboxGuard}
 		}
 		if current.AllDebridToken != "" {
-			providers["alldebrid"] = &debrid.AllDebrid{Token: current.AllDebridToken, Client: apiClient, AllowUncached: current.AllowUncached}
+			providers["alldebrid"] = &debrid.AllDebrid{Token: current.AllDebridToken, Client: apiClient, AllowUncached: current.AllowUncached, Guard: alldebridGuard}
 		}
 		return providers
 	}
@@ -61,7 +63,7 @@ func main() {
 		if err != nil {
 			return nil, err
 		}
-		return &scraper.Aggregator{Addons: addons, Client: apiClient, Log: log}, nil
+		return &scraper.Aggregator{Addons: addons, Client: apiClient, Log: log, RateLimitGuard: scraperGuard}, nil
 	}
 	plex := &service.Plex{Config: cfg, Settings: settings.Snapshot, Client: apiClient, Log: log}
 	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, ResolutionConcurrency: cfg.ResolutionConcurrency, LibraryChanged: plex.Notify, Log: log}

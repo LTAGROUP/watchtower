@@ -19,6 +19,7 @@ type AllDebrid struct {
 	Client        *http.Client
 	AllowUncached bool
 	Poll          time.Duration
+	Guard         *ProviderGuard
 }
 
 func (a *AllDebrid) Name() string { return "alldebrid" }
@@ -34,14 +35,19 @@ func (a *AllDebrid) Resolve(ctx context.Context, r model.Release) (model.Resolve
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.alldebrid.com/v4/magnet/upload/file", &b)
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 		req.Header.Set("Content-Type", mw.FormDataContentType())
+		if err := a.guardWait(ctx, "alldebrid magnet upload file"); err != nil {
+			return model.Resolved{}, err
+		}
 		resp, e := a.Client.Do(req)
 		if e != nil {
 			return model.Resolved{}, e
 		}
-		defer resp.Body.Close()
-		err = jsonDecode(resp.Body, &raw)
+		raw, err = decodeAPIResponse(resp, "alldebrid")
+		if err != nil {
+			return model.Resolved{}, a.guardError(err)
+		}
 	} else {
-		raw, err = doForm(ctx, a.Client, http.MethodPost, "https://api.alldebrid.com/v4/magnet/upload", a.Token, url.Values{"magnets[]": {r.DownloadURL}})
+		raw, err = a.form(ctx, http.MethodPost, "https://api.alldebrid.com/v4/magnet/upload", url.Values{"magnets[]": {r.DownloadURL}})
 	}
 	if err != nil {
 		return model.Resolved{}, err
@@ -74,8 +80,11 @@ func (a *AllDebrid) wait(ctx context.Context, id int64) (model.Resolved, error) 
 		case <-ctx.Done():
 			return model.Resolved{}, ctx.Err()
 		case <-tick.C:
-			raw, e := doForm(ctx, a.Client, http.MethodPost, "https://api.alldebrid.com/v4.1/magnet/status", a.Token, url.Values{"id": {strconv.FormatInt(id, 10)}})
+			raw, e := a.form(ctx, http.MethodPost, "https://api.alldebrid.com/v4.1/magnet/status", url.Values{"id": {strconv.FormatInt(id, 10)}})
 			if e != nil {
+				if _, cooldown := ProviderCooldown(e); cooldown {
+					return model.Resolved{}, e
+				}
 				continue
 			}
 			d := object(raw["data"])
@@ -91,7 +100,7 @@ func (a *AllDebrid) wait(ctx context.Context, id int64) (model.Resolved, error) 
 				return model.Resolved{}, fmt.Errorf("alldebrid magnet failed: %s", status)
 			}
 			if status == "ready" || num(m["statusCode"]) == 4 {
-				fr, e := doForm(ctx, a.Client, http.MethodPost, "https://api.alldebrid.com/v4/magnet/files", a.Token, url.Values{"id": {strconv.FormatInt(id, 10)}})
+				fr, e := a.form(ctx, http.MethodPost, "https://api.alldebrid.com/v4/magnet/files", url.Values{"id": {strconv.FormatInt(id, 10)}})
 				if e != nil {
 					return model.Resolved{}, e
 				}
@@ -116,7 +125,7 @@ func walkAD(nodes []any, out *[]model.RemoteFile) {
 	}
 }
 func (a *AllDebrid) StreamURL(ctx context.Context, f *model.File) (string, error) {
-	raw, e := doForm(ctx, a.Client, http.MethodPost, "https://api.alldebrid.com/v4/link/unlock", a.Token, url.Values{"link": {f.ProviderFileID}})
+	raw, e := a.form(ctx, http.MethodPost, "https://api.alldebrid.com/v4/link/unlock", url.Values{"link": {f.ProviderFileID}})
 	if e != nil {
 		return "", e
 	}
@@ -125,4 +134,28 @@ func (a *AllDebrid) StreamURL(ctx context.Context, f *model.File) (string, error
 		return s, nil
 	}
 	return "", fmt.Errorf("alldebrid returned no stream URL")
+}
+
+func (a *AllDebrid) form(ctx context.Context, method, endpoint string, values url.Values) (map[string]any, error) {
+	if err := a.guardWait(ctx, endpoint); err != nil {
+		return nil, err
+	}
+	raw, err := doForm(ctx, a.Client, method, endpoint, a.Token, values)
+	return raw, a.guardError(err)
+}
+
+func (a *AllDebrid) guardWait(ctx context.Context, endpoint string) error {
+	if a.Guard == nil {
+		return nil
+	}
+	return a.Guard.Wait(ctx, endpoint)
+}
+
+func (a *AllDebrid) guardError(err error) error {
+	if err != nil {
+		if delay, ok := ProviderCooldown(err); ok && a.Guard != nil {
+			a.Guard.Block(delay)
+		}
+	}
+	return err
 }

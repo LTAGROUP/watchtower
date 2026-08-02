@@ -57,7 +57,7 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 				http.Error(w, e.Error(), http.StatusTooManyRequests)
 				return
 			}
-			willRetry := errors.Is(e, debrid.ErrTransient) && attempt+1 < maxAttempts
+			willRetry := (errors.Is(e, debrid.ErrTransient) || errors.Is(e, debrid.ErrProviderUnavailable)) && attempt+1 < maxAttempts
 			if s.Log != nil {
 				attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt + 1, "will_retry", willRetry, "error", e}
 				if willRetry {

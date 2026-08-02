@@ -37,6 +37,59 @@ type Aggregator struct {
 	Client              *http.Client
 	Log                 *slog.Logger
 	RateLimitRetryDelay time.Duration
+	RateLimitGuard      *RateLimitGuard
+}
+
+// RateLimitGuard shares addon cooldowns across concurrent searches. A single
+// Torrentio 429 should stop every other job from immediately repeating the
+// same request while allowing the current bounded retry to finish.
+type RateLimitGuard struct {
+	mu              sync.Mutex
+	defaultCooldown time.Duration
+	blockedUntil    map[string]time.Time
+}
+
+func NewRateLimitGuard(defaultCooldown time.Duration) *RateLimitGuard {
+	if defaultCooldown <= 0 {
+		defaultCooldown = 2 * time.Second
+	}
+	return &RateLimitGuard{defaultCooldown: defaultCooldown, blockedUntil: map[string]time.Time{}}
+}
+
+func (g *RateLimitGuard) Wait(ctx context.Context, addon string) error {
+	if g == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	g.mu.Lock()
+	delay := g.blockedUntil[addon].Sub(time.Now())
+	g.mu.Unlock()
+	if delay > 0 {
+		return fmt.Errorf("%s: %w (cooldown active; retry after %s)", addon, ErrRateLimited, formatCooldown(delay))
+	}
+	return nil
+}
+
+func (g *RateLimitGuard) Block(addon string, delay time.Duration) {
+	if g == nil {
+		return
+	}
+	if delay <= 0 {
+		delay = g.defaultCooldown
+	}
+	blockedUntil := time.Now().Add(delay)
+	g.mu.Lock()
+	if g.blockedUntil == nil {
+		g.blockedUntil = map[string]time.Time{}
+	}
+	if blockedUntil.After(g.blockedUntil[addon]) {
+		g.blockedUntil[addon] = blockedUntil
+	}
+	g.mu.Unlock()
 }
 
 type streamResponse struct {
@@ -168,6 +221,11 @@ func (a *Aggregator) searchAddon(ctx context.Context, addon Addon, mediaType, id
 	u := addon.BaseURL + "/stream/" + url.PathEscape(mediaType) + "/" + url.PathEscape(id) + ".json"
 	var payload streamResponse
 	for attempt := 0; attempt < 2; attempt++ {
+		if attempt == 0 {
+			if err := a.RateLimitGuard.Wait(ctx, addon.Name); err != nil {
+				return nil, err
+			}
+		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "WatchTower/1.0")
@@ -178,6 +236,7 @@ func (a *Aggregator) searchAddon(ctx context.Context, addon Addon, mediaType, id
 		if resp.StatusCode == http.StatusTooManyRequests {
 			delay := a.rateLimitDelay(resp.Header.Get("Retry-After"))
 			resp.Body.Close()
+			a.RateLimitGuard.Block(addon.Name, delay)
 			if attempt == 0 {
 				if a.Log != nil {
 					a.Log.Warn("scraper rate limited; retrying", "component", "scraper", "addon", addon.Name, "retry_after", delay.String())
@@ -222,6 +281,13 @@ func (a *Aggregator) searchAddon(ctx context.Context, addon Addon, mediaType, id
 		out = append(out, model.Release{Title: title, DownloadURL: magnet, InfoHash: hash, Source: addon.Name, Size: size, Seeders: seeders})
 	}
 	return out, nil
+}
+
+func formatCooldown(delay time.Duration) string {
+	if rounded := delay.Round(time.Second); rounded > 0 {
+		return rounded.String()
+	}
+	return delay.String()
 }
 
 func (a *Aggregator) rateLimitDelay(value string) time.Duration {

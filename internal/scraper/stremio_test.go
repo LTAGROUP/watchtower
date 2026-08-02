@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseAddonsKeepsConfiguredPath(t *testing.T) {
@@ -97,5 +98,18 @@ func TestAggregatorReturnsRateLimitAfterBoundedRetry(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("expected exactly one retry, got %d calls", calls)
+	}
+}
+
+func TestRateLimitGuardFailsFastDuringAddonCooldown(t *testing.T) {
+	guard := NewRateLimitGuard(time.Minute)
+	guard.Block("torrentio", time.Minute)
+	started := time.Now()
+	err := guard.Wait(context.Background(), "torrentio")
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("expected rate-limit error, got %v", err)
+	}
+	if time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("addon cooldown check blocked instead of failing fast")
 	}
 }
