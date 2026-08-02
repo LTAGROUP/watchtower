@@ -324,6 +324,13 @@ jobLoop:
 	if !deferred {
 		currentFiles := r.Store.FilesForMedia(m.ID)
 		m.Status = ResolvedMediaStatus(m, currentFiles, cfg.Qualities)
+		if replaceExisting && len(errs) > 0 {
+			if total == 0 {
+				m.Status = "failed"
+			} else if m.Status == "ready" {
+				m.Status = "partial"
+			}
+		}
 		if m.Status == "failed" {
 			m.Error = strings.Join(errs, "; ")
 		} else if m.Status == "partial" {

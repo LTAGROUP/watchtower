@@ -70,6 +70,11 @@ func EffectiveMediaStatus(media *model.Media, files []*model.File, qualities []s
 }
 
 func ResolvedMediaStatus(media *model.Media, files []*model.File, qualities []string) string {
+	if media.Status == "ready" && len(files) > 0 && !hasQualityMetadata(files) {
+		// Older state files may contain files created before quality was stored.
+		// Preserve their known-good status until the media is resolved again.
+		return "ready"
+	}
 	availability := QualityAvailability(media, files, qualities)
 	for _, quality := range availability {
 		if quality.Complete {
@@ -80,6 +85,15 @@ func ResolvedMediaStatus(media *model.Media, files []*model.File, qualities []st
 		return "partial"
 	}
 	return "failed"
+}
+
+func hasQualityMetadata(files []*model.File) bool {
+	for _, file := range files {
+		if strings.TrimSpace(file.Quality) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func qualityOrder(quality string, configured []string) int {
