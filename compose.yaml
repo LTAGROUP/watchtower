@@ -45,7 +45,7 @@ services:
       - --vfs-refresh
       - --vfs-fast-fingerprint
       - --no-modtime
-      - --dir-cache-time=30s
+      - --dir-cache-time=${VFS_DIR_CACHE_TIME:-10s}
       - --poll-interval=0
       - --log-level=INFO
     cap_add: [SYS_ADMIN]

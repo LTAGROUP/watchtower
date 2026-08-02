@@ -39,7 +39,7 @@ func Load() Config {
 		Providers: csv(env("PROVIDERS", "torbox,alldebrid")), Qualities: csv(env("QUALITIES", "2160p,1080p")),
 		StremioAddons: list(env("STREMIO_ADDONS", "torrentio|https://torrentio.strem.fun/manifest.json")),
 		PollInterval:  duration("SEERR_POLL_INTERVAL", 2*time.Minute), ResolveTimeout: duration("RESOLVE_TIMEOUT", 15*time.Minute),
-		StreamURLTTL: duration("STREAM_URL_TTL", 45*time.Minute), PlexScanDelay: duration("PLEX_SCAN_DELAY", 45*time.Second), MinSeeders: integer("MIN_SEEDERS", 0),
+		StreamURLTTL: duration("STREAM_URL_TTL", 45*time.Minute), PlexScanDelay: duration("PLEX_SCAN_DELAY", 15*time.Second), MinSeeders: integer("MIN_SEEDERS", 0),
 		TorBoxRequestInterval: duration("TORBOX_REQUEST_INTERVAL", 250*time.Millisecond), TorBoxRateLimitCooldown: duration("TORBOX_RATE_LIMIT_COOLDOWN", time.Minute),
 		TorBoxUncachedCreateInterval: duration("TORBOX_UNCACHED_CREATE_INTERVAL", time.Minute),
 		AllDebridProviderCooldown:    duration("ALLDEBRID_PROVIDER_COOLDOWN", time.Minute),

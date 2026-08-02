@@ -97,7 +97,7 @@ func OpenManager(base Config) (*Manager, error) {
 func editableFrom(c Config) EditableSettings {
 	plexScanDelay := c.PlexScanDelay
 	if plexScanDelay <= 0 {
-		plexScanDelay = 45 * time.Second
+		plexScanDelay = 15 * time.Second
 	}
 	return EditableSettings{
 		SeerrURL: c.SeerrURL, SeerrAPIKey: c.SeerrAPIKey,

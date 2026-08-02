@@ -52,7 +52,7 @@ func (p *Plex) Run(ctx context.Context) {
 		case <-p.changes:
 			delay := p.currentConfig().PlexScanDelay
 			if delay <= 0 {
-				delay = 45 * time.Second
+				delay = 15 * time.Second
 			}
 			if timer == nil {
 				timer = time.NewTimer(delay)

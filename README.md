@@ -125,9 +125,10 @@ Seerr stack can reach the webhook. Use the Docker host's LAN IP in Seerr, not
 | `WATCHTOWER_CORE_PORT` | `8080` | Host port for the core API, WebDAV, health check, and Seerr webhook |
 | `PLEX_URL` | empty | Plex server URL reachable from WatchTower |
 | `PLEX_TOKEN` | empty | Plex access token used only for library refresh requests |
-| `PLEX_SCAN_DELAY` | `45s` | Delay/batch window before refreshing Plex; should exceed rclone's directory cache time |
+| `PLEX_SCAN_DELAY` | `15s` | Delay/batch window before refreshing Plex; should exceed rclone's directory cache time |
 | `VFS_CACHE_MAX_SIZE` | `20G` | Maximum transient rclone read cache size |
 | `VFS_CACHE_MAX_AGE` | `24h` | Evict cached chunks after their last access |
+| `VFS_DIR_CACHE_TIME` | `10s` | How long rclone caches directory listings before checking WebDAV again |
 | `VFS_READ_CHUNK_SIZE` | `4M` | Initial remote range-read size |
 | `VFS_READ_CHUNK_SIZE_LIMIT` | `128M` | Maximum sequential chunk size |
 
