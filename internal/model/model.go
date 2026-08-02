@@ -23,6 +23,13 @@ type Media struct {
 	ScrapedAt     time.Time   `json:"scrapedAt,omitempty"`
 }
 
+type QualityAvailability struct {
+	Quality   string `json:"quality"`
+	Available int    `json:"available"`
+	Expected  int    `json:"expected"`
+	Complete  bool   `json:"complete"`
+}
+
 type File struct {
 	ID              string    `json:"id"`
 	MediaID         int64     `json:"mediaId"`

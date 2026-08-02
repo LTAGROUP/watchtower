@@ -298,12 +298,6 @@ jobLoop:
 		}
 	}
 	total := len(resolvedFilesBySlot)
-	completed := 0
-	for _, work := range jobs {
-		if completedSlots[resolutionSlot(m.Type, work.quality, work.season, work.episode)] {
-			completed++
-		}
-	}
 	if deferred {
 		m.Status = "queued"
 		if delay, cooling := r.allProvidersCooling(cfg.Providers, providers); cooling {
@@ -311,15 +305,6 @@ jobLoop:
 		} else {
 			m.Error = "provider cooldown active; retry later"
 		}
-	} else if len(jobs) > 0 && completed == len(jobs) {
-		m.Status = "ready"
-		m.Error = ""
-	} else if completed == 0 {
-		m.Status = "failed"
-		m.Error = strings.Join(errs, "; ")
-	} else {
-		m.Status = "partial"
-		m.Error = strings.Join(errs, "; ")
 	}
 	if total > 0 {
 		finalFiles := make([]*model.File, 0, total)
@@ -334,6 +319,17 @@ jobLoop:
 		}
 		if err := r.Store.ReplaceFilesForMedia(m.ID, finalFiles...); err != nil {
 			return err
+		}
+	}
+	if !deferred {
+		currentFiles := r.Store.FilesForMedia(m.ID)
+		m.Status = ResolvedMediaStatus(m, currentFiles, cfg.Qualities)
+		if m.Status == "failed" {
+			m.Error = strings.Join(errs, "; ")
+		} else if m.Status == "partial" {
+			m.Error = strings.Join(errs, "; ")
+		} else {
+			m.Error = ""
 		}
 	}
 	m.UpdatedAt = time.Now().UTC()

@@ -41,6 +41,11 @@ type Handler struct {
 	direct   sync.Map
 }
 
+type libraryMediaView struct {
+	*model.Media
+	QualityAvailability []model.QualityAvailability `json:"qualityAvailability"`
+}
+
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/summary", h.summary)
@@ -71,8 +76,8 @@ func (h *Handler) logs(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) summary(w http.ResponseWriter, _ *http.Request) {
-	media := h.Store.Media()
 	files := h.Store.Files()
+	media := h.mediaViews(h.Store.Media(), files)
 	statuses := map[string]int{"queued": 0, "unreleased": 0, "scraping": 0, "resolving": 0, "ready": 0, "partial": 0, "failed": 0}
 	scraped := 0
 	var bytes int64
@@ -92,13 +97,34 @@ func (h *Handler) summary(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) library(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"media": h.Store.Media(), "files": h.Store.Files()})
+	files := h.Store.Files()
+	writeJSON(w, http.StatusOK, map[string]any{"media": h.mediaViews(h.Store.Media(), files), "files": files})
+}
+
+func (h *Handler) mediaViews(items []*model.Media, files []*model.File) []libraryMediaView {
+	qualities := []string(nil)
+	if h.Settings != nil {
+		qualities = h.Settings.Snapshot().Qualities
+	}
+	byMedia := make(map[int64][]*model.File)
+	for _, file := range files {
+		byMedia[file.MediaID] = append(byMedia[file.MediaID], file)
+	}
+	views := make([]libraryMediaView, 0, len(items))
+	for _, item := range items {
+		copy := *item
+		mediaFiles := byMedia[item.ID]
+		copy.Status = service.EffectiveMediaStatus(&copy, mediaFiles, qualities)
+		views = append(views, libraryMediaView{Media: &copy, QualityAvailability: service.QualityAvailability(&copy, mediaFiles, qualities)})
+	}
+	return views
 }
 
 func (h *Handler) queue(w http.ResponseWriter, _ *http.Request) {
-	items := h.Store.Media()
+	files := h.Store.Files()
+	items := h.mediaViews(h.Store.Media(), files)
 	sort.Slice(items, func(i, j int) bool { return items[i].UpdatedAt.After(items[j].UpdatedAt) })
-	active := make([]*model.Media, 0)
+	active := make([]libraryMediaView, 0)
 	for _, item := range items {
 		if item.Status != "ready" {
 			active = append(active, item)

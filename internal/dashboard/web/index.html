@@ -101,6 +101,10 @@
             <button type="button" data-library-type="tv" aria-pressed="false">TV <span id="library-tv-count">0</span></button>
           </div>
         </div>
+        <div class="library-filters">
+          <label><span>Status</span><select id="library-status"><option value="all">All statuses</option><option value="ready">Ready</option><option value="partial">Missing episodes</option><option value="failed">Failed</option><option value="queued">Queued</option><option value="scraping">Scraping</option><option value="resolving">Resolving</option><option value="unreleased">Unreleased</option></select></label>
+          <label><span>Resolution</span><select id="library-quality"><option value="all">All resolutions</option></select></label>
+        </div>
         <div id="library-media-grid" class="poster-grid library-grid"></div>
         <div id="library-files-table" class="table-card" hidden>
           <div class="table-scroll"><table><thead id="library-head"></thead><tbody id="library-body"></tbody></table></div>

@@ -1,6 +1,6 @@
 const state = {
   route: 'dashboard', summary: null, media: [], files: [], queue: [], settings: null,
-  libraryTab: 'media', libraryType: 'all', queueType: 'all', queueStatus: 'all', detailCache: new Map(), detail: null,
+  libraryTab: 'media', libraryType: 'all', libraryStatus: 'all', libraryQuality: 'all', queueType: 'all', queueStatus: 'all', detailCache: new Map(), detail: null,
   discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true },
   logs: { entries: [], capacity: 0, loading: false }
 };
@@ -84,19 +84,27 @@ function renderDashboard() {
 function renderLibrary() {
   const type = state.libraryType;
   const typedMedia = state.media.filter(item => type === 'all' || item.type === type);
-  const typedMediaIDs = new Set(typedMedia.map(item => Number(item.id)));
-  const typedFiles = state.files.filter(file => type === 'all' || typedMediaIDs.has(Number(file.mediaId)) || mediaTypeForFile(file) === type);
+  updateLibraryQualityOptions();
+  const matchesMedia = item => (state.libraryStatus === 'all' || item.status === state.libraryStatus) && matchesQualityFilter(item, state.libraryQuality);
+  const filteredMedia = typedMedia.filter(matchesMedia);
+  const filteredMediaIDs = new Set(filteredMedia.map(item => Number(item.id)));
+  const typedFiles = state.files.filter(file => {
+    if (type !== 'all' && !filteredMediaIDs.has(Number(file.mediaId)) && mediaTypeForFile(file) !== type) return false;
+    const owner = state.media.find(item => Number(item.id) === Number(file.mediaId));
+    if (owner && !matchesMedia(owner)) return false;
+    return matchesFileQuality(file, state.libraryQuality);
+  });
   $('#library-all-count').textContent = state.media.length;
   $('#library-movie-count').textContent = state.media.filter(item => item.type === 'movie').length;
   $('#library-tv-count').textContent = state.media.filter(item => item.type === 'tv').length;
-  $('#media-tab-count').textContent = typedMedia.length;
+  $('#media-tab-count').textContent = filteredMedia.length;
   $('#files-tab-count').textContent = typedFiles.length;
   const query = ($('#library-search')?.value || '').trim().toLowerCase();
   const isMedia = state.libraryTab === 'media';
   $('#library-media-grid').hidden = !isMedia;
   $('#library-files-table').hidden = isMedia;
   if (isMedia) {
-    const items = [...typedMedia].sort((a,b) => String(a.title).localeCompare(String(b.title))).filter(item => `${item.title} ${item.year} ${item.status}`.toLowerCase().includes(query));
+    const items = [...filteredMedia].sort((a,b) => String(a.title).localeCompare(String(b.title))).filter(item => `${item.title} ${item.year} ${item.status} ${qualitySearchText(item)}`.toLowerCase().includes(query));
     $('#library-media-grid').innerHTML = items.length ? items.map(libraryCard).join('') : '<div class="panel empty-state">No titles match these filters.</div>';
     bindImageFallbacks($('#library-media-grid'));
     return;
@@ -109,7 +117,9 @@ function renderLibrary() {
 function libraryCard(item) {
   const poster = item.posterPath && /^\/[A-Za-z0-9._-]+$/.test(item.posterPath) ? `https://image.tmdb.org/t/p/w500${item.posterPath}` : `/api/v1/media/${item.id}/poster`;
   const inventory = item.type === 'tv' ? episodeProgress(item) : `${filesFor(item.id).length} files`;
-  return `<article class="poster-card" role="button" tabindex="0" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}"><div class="poster"><div class="poster-fallback">${escapeHTML(item.title)}</div><img src="${poster}" alt="" loading="lazy"><span class="poster-status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span><div class="poster-overlay"><button class="button ghost" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}">View details</button></div></div><div class="poster-copy"><strong title="${escapeHTML(item.title)}">${escapeHTML(item.title)}</strong><small><span>${item.year || '—'}</span><span>${item.type === 'tv' ? 'TV' : 'Movie'} · ${escapeHTML(inventory)}</span></small></div></article>`;
+  const availability = qualityBadges(item);
+  const stateBadge = item.status === 'partial' ? '<span class="poster-status partial">Missing episodes</span>' : !['ready', 'partial'].includes(item.status) ? `<span class="poster-status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span>` : '';
+  return `<article class="poster-card" role="button" tabindex="0" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}"><div class="poster"><div class="poster-fallback">${escapeHTML(item.title)}</div><img src="${poster}" alt="" loading="lazy">${stateBadge}<div class="poster-overlay"><button class="button ghost" data-detail-type="${item.type}" data-detail-id="${item.tmdbId}">View details</button></div></div><div class="poster-copy"><strong title="${escapeHTML(item.title)}">${escapeHTML(item.title)}</strong><small><span>${item.year || '—'}</span><span>${item.type === 'tv' ? 'TV' : 'Movie'} · ${escapeHTML(inventory)}</span></small>${availability}</div></article>`;
 }
 
 function renderQueue() {
@@ -492,6 +502,69 @@ function bindImageFallbacks(root) {
 }
 function isInLibrary(type, tmdbID) { return state.media.some(item => item.type === type && Number(item.tmdbId) === Number(tmdbID)); }
 function filesFor(mediaId) { return state.files.filter(file => Number(file.mediaId) === Number(mediaId)); }
+function qualityLabel(quality = '') {
+  const value = String(quality).toLowerCase();
+  if (['2160p', '4k', 'uhd'].includes(value)) return '4K';
+  if (['1080p', 'fhd'].includes(value)) return '1080p';
+  if (value === '720p') return '720p';
+  if (value === '480p') return '480p';
+  return quality;
+}
+function qualityAvailability(item) { return Array.isArray(item.qualityAvailability) ? item.qualityAvailability : []; }
+function qualitySearchText(item) { return qualityAvailability(item).map(item => `${item.quality} ${qualityLabel(item.quality)} ${item.available}/${item.expected}`).join(' '); }
+function qualityFilterParts(filter) {
+  if (!filter || filter === 'all') return null;
+  const separator = filter.indexOf(':');
+  return {mode: separator < 0 ? 'has' : filter.slice(0, separator), quality: decodeURIComponent(separator < 0 ? filter : filter.slice(separator + 1))};
+}
+function matchesQualityFilter(item, filter) {
+  const selected = qualityFilterParts(filter);
+  if (!selected) return true;
+  const availability = qualityAvailability(item).find(value => String(value.quality).toLowerCase() === selected.quality.toLowerCase());
+  if (selected.mode === 'missing') return !availability || availability.available === 0;
+  if (selected.mode === 'complete') return Boolean(availability?.complete);
+  return Boolean(availability?.available > 0);
+}
+function matchesFileQuality(file, filter) {
+  const selected = qualityFilterParts(filter);
+  if (!selected) return true;
+  if (selected.mode === 'missing') return false;
+  return String(file.quality || '').toLowerCase() === selected.quality.toLowerCase();
+}
+function updateLibraryQualityOptions() {
+  const select = $('#library-quality');
+  if (!select) return;
+  const qualities = [];
+  const seen = new Set();
+  state.media.flatMap(qualityAvailability).forEach(value => {
+    const quality = String(value.quality || '').trim();
+    const key = quality.toLowerCase();
+    if (quality && !seen.has(key)) { seen.add(key); qualities.push(quality); }
+  });
+  select.innerHTML = '<option value="all">All resolutions</option>' + qualities.map(quality => {
+    const value = encodeURIComponent(quality);
+    const label = escapeHTML(qualityLabel(quality));
+    return `<option value="complete:${value}">Complete ${label}</option><option value="has:${value}">Has ${label}</option><option value="missing:${value}">Missing ${label}</option>`;
+  }).join('');
+  if (!Array.from(select.options).some(option => option.value === state.libraryQuality)) {
+    state.libraryQuality = 'all';
+  }
+  select.value = state.libraryQuality;
+}
+function qualityBadges(item) {
+  const values = qualityAvailability(item);
+  if (!values.length) return '';
+  return `<div class="quality-badges">${values.map(value => {
+    const available = Number(value.available || 0);
+    const expected = Number(value.expected || 0);
+    const complete = Boolean(value.complete);
+    const stateName = complete ? 'complete' : available > 0 ? 'available' : 'missing';
+    const label = qualityLabel(value.quality);
+    const count = item.type === 'tv' && available > 0 && !complete && expected > 0 ? ` ${available}/${expected}` : '';
+    const description = complete ? `${label} available` : available > 0 ? `${label}: ${available}${expected ? ` of ${expected}` : ''} available` : `${label} unavailable`;
+    return `<span class="quality-badge ${stateName}" title="${escapeHTML(description)}">${escapeHTML(label)}${count}</span>`;
+  }).join('')}</div>`;
+}
 function mediaTypeForFile(file) { const media = state.media.find(item => Number(item.id) === Number(file.mediaId)); if (media?.type) return media.type; return /^TV\//i.test(file.path || '') ? 'tv' : /^Movies\//i.test(file.path || '') ? 'movie' : ''; }
 function episodeRef(path = '') { const match = String(path).match(/S(\d{1,2})E(\d{1,3})/i); return match ? {season:Number(match[1]), episode:Number(match[2])} : null; }
 function episodeKeys(files, season = null) { const keys = new Set(); files.forEach(file => { const ref = episodeRef(file.path); if (ref && (season == null || ref.season === Number(season))) keys.add(`${ref.season}:${ref.episode}`); }); return keys; }
@@ -515,6 +588,8 @@ $('#log-level').addEventListener('change', renderLogs);
 $('#log-component').addEventListener('change', renderLogs);
 $('#log-sort').addEventListener('change', renderLogs);
 $('#log-refresh').addEventListener('click', loadLogs);
+$('#library-status').addEventListener('change', event => { state.libraryStatus = event.target.value; renderLibrary(); });
+$('#library-quality').addEventListener('change', event => { state.libraryQuality = event.target.value; renderLibrary(); });
 $$('[data-library-tab]').forEach(tab => tab.addEventListener('click', () => { state.libraryTab = tab.dataset.libraryTab; $$('[data-library-tab]').forEach(t => { t.classList.toggle('active', t === tab); t.setAttribute('aria-selected', String(t === tab)); }); renderLibrary(); }));
 $$('[data-library-type]').forEach(button => button.addEventListener('click', () => { state.libraryType = button.dataset.libraryType; $$('[data-library-type]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', String(item === button)); }); renderLibrary(); }));
 $$('[data-queue-type]').forEach(button => button.addEventListener('click', () => { state.queueType = button.dataset.queueType; $$('[data-queue-type]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', String(item === button)); }); renderQueue(); }));

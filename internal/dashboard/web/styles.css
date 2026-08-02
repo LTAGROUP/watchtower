@@ -152,8 +152,18 @@ input::placeholder, textarea::placeholder { color: #565e6a; }
 .poster-copy small { display: flex; justify-content: space-between; color: var(--muted); margin-top: 5px; font-size: 9px; }
 .poster-status { position: absolute; top: 8px; left: 8px; z-index: 4; padding: 5px 8px; border-radius: 20px; background: rgba(7,9,12,.84); backdrop-filter: blur(8px); color: #d5dae2; font-size: 8px; font-weight: 800; text-transform: capitalize; }
 .poster-status.ready { color: var(--good); }
+.poster-status.failed { color: var(--bad); }
+.poster-status.partial { color: #e2bd7e; }
 .poster-status.unreleased { color: #8db9ff; }
+.quality-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.poster-copy .quality-badges { margin-top: 7px; }
+.quality-badge { display: inline-flex; align-items: center; min-height: 20px; padding: 3px 7px; border: 1px solid #303744; border-radius: 999px; background: #171c23; color: #aeb7c4; font-size: 9px; font-weight: 800; line-height: 1; }
+.quality-badge.complete { border-color: rgba(114,214,160,.35); background: rgba(114,214,160,.1); color: var(--good); }
+.quality-badge.available { border-color: rgba(214,170,99,.35); background: rgba(214,170,99,.1); color: #e2bd7e; }
+.quality-badge.missing { color: #747d89; background: #14181e; }
 .library-grid { margin-top: 14px; }
+.library-filters { display: flex; gap: 8px; align-items: end; margin: 12px 0 4px; }
+.library-filters label { width: 180px; }
 .scroll-sentinel { height: 40px; display: grid; place-items: center; color: var(--muted); font-size: 10px; }
 .compact-search { width: min(280px, 40vw); position: relative; }
 .compact-search > span { position: absolute; left: 11px; bottom: 7px; font-size: 17px; color: var(--muted); }
@@ -362,6 +372,8 @@ dialog::backdrop { background: rgba(4,5,8,.75); backdrop-filter: blur(5px); }
   .tabs { min-height: 42px; }
   .segmented-control { width: 100%; }
   .segmented-control button { flex: 1; }
+  .library-filters { display: grid; grid-template-columns: 1fr 1fr; }
+  .library-filters label { width: auto; }
   .queue-toolbar { margin-top: -6px; align-items: stretch; flex-direction: column; }
   .queue-status-filter { width: 100%; }
   .queue-summary { grid-template-columns: 1fr 1fr; }

@@ -124,8 +124,12 @@ func TestLibraryUsesFrontendJSONFieldNames(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Media[0]["id"] != float64(8) || result.Media[0]["status"] != "partial" || result.Files[0]["path"] != "Movies/Example.mkv" {
+	if result.Media[0]["id"] != float64(8) || result.Media[0]["status"] != "ready" || result.Files[0]["path"] != "Movies/Example.mkv" {
 		t.Fatalf("unexpected library JSON: %#v", result)
+	}
+	availability, ok := result.Media[0]["qualityAvailability"].([]any)
+	if !ok || len(availability) != 1 {
+		t.Fatalf("unexpected quality availability: %#v", result.Media[0]["qualityAvailability"])
 	}
 }
 
