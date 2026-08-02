@@ -1,7 +1,6 @@
 package dashboard
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
@@ -16,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/LTAGROUP/watchtower/internal/config"
@@ -30,15 +28,15 @@ import (
 var webFiles embed.FS
 
 type Handler struct {
-	Store    *store.Store
-	Settings *config.Manager
-	Resolver *service.Resolver
-	Seerr    *service.Seerr
-	Username string
-	Password string
-	Log      *slog.Logger
-	Logs     *logging.Buffer
-	direct   sync.Map
+	Store     *store.Store
+	Settings  *config.Manager
+	Resolver  *service.Resolver
+	Seerr     *service.Seerr
+	Scheduler *service.Lifecycle
+	Username  string
+	Password  string
+	Log       *slog.Logger
+	Logs      *logging.Buffer
 }
 
 type libraryMediaView struct {
@@ -204,14 +202,29 @@ func (h *Handler) createRequest(w http.ResponseWriter, r *http.Request) {
 		ID: directMediaID(input.MediaType, input.MediaID), Type: input.MediaType, TMDBID: input.MediaID,
 		ExternalID: externalID, Title: title, Year: year, Overview: details.Overview,
 		PosterPath: details.PosterPath, BackdropPath: details.BackdropPath,
-		Seasons: input.Seasons, EpisodeCounts: service.CatalogEpisodeCounts(input.Seasons, details.Seasons), ReleaseDate: h.Seerr.MediaReleaseDate(r.Context(), input.MediaType, input.MediaID, details, input.Seasons), Status: "queued", CreatedAt: now, UpdatedAt: now,
+		Seasons: input.Seasons, ReleaseDate: h.Seerr.MediaReleaseDate(r.Context(), input.MediaType, input.MediaID, details, input.Seasons), Status: "queued", CreatedAt: now, UpdatedAt: now,
 	}
-	if err := h.Store.UpsertMedia(item); err != nil {
+	if input.MediaType == "tv" {
+		if counts, dates, firstAir, scheduleErr := h.Seerr.EpisodeSchedule(r.Context(), input.MediaID, input.Seasons, details); scheduleErr == nil {
+			item.EpisodeCounts, item.EpisodeAirDates = counts, dates
+			if firstAir != "" && (item.ReleaseDate == "" || firstAir < item.ReleaseDate) {
+				item.ReleaseDate = firstAir
+			}
+		} else if h.Log != nil {
+			h.Log.Warn("direct request episode schedule unavailable", "media", input.MediaID, "error", scheduleErr)
+		}
+	}
+	if h.Resolver == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("media resolver is unavailable"))
+		return
+	}
+	queued, err := h.Resolver.Queue(item)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	go h.resolveDirect(item)
-	writeJSON(w, http.StatusAccepted, map[string]any{"media": item})
+	h.wakeScheduler()
+	writeJSON(w, http.StatusAccepted, map[string]any{"media": queued})
 }
 
 func (h *Handler) catalogDetails(w http.ResponseWriter, r *http.Request) {
@@ -221,8 +234,12 @@ func (h *Handler) catalogDetails(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("invalid catalog item"))
 		return
 	}
+	// Keep this pre-fetch record only as a catalog/schedule snapshot. It must
+	// never be written back wholesale after an HTTP call: a resolver can claim
+	// newer durable work while Seerr is responding.
 	media, inLibrary := h.Store.FindMediaByTMDB(kind, tmdbID)
 	details, err := h.Seerr.Catalog(r.Context(), kind, tmdbID)
+	catalogFetched := err == nil
 	if err != nil {
 		if !inLibrary {
 			writeError(w, http.StatusBadGateway, err)
@@ -230,22 +247,61 @@ func (h *Handler) catalogDetails(w http.ResponseWriter, r *http.Request) {
 		}
 		details = catalogFromMedia(media)
 	}
-	if inLibrary {
-		changed := media.Overview == "" || media.PosterPath == "" || media.BackdropPath == ""
-		media.Overview, media.PosterPath, media.BackdropPath = details.Overview, details.PosterPath, details.BackdropPath
-		if counts := service.CatalogEpisodeCounts(media.Seasons, details.Seasons); len(counts) > 0 {
-			media.EpisodeCounts = counts
-			changed = true
+	if inLibrary && catalogFetched {
+		var schedule *episodeSchedule
+		if media.Type == "tv" {
+			counts, dates, _, scheduleErr := h.Seerr.EpisodeSchedule(r.Context(), tmdbID, media.Seasons, details)
+			if scheduleErr == nil {
+				schedule = &episodeSchedule{counts: counts, dates: dates}
+			} else if h.Log != nil {
+				h.Log.Warn("catalog episode schedule unavailable", "media", tmdbID, "error", scheduleErr)
+			}
 		}
-		if changed {
-			_ = h.Store.UpsertMedia(media)
-		}
+		media, inLibrary = h.patchCatalogMetadata(media, details, schedule)
 	}
 	files := []detailFile{}
 	if inLibrary {
 		files = detailFiles(h.Store.FilesForMedia(media.ID))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"details": details, "inLibrary": inLibrary, "media": media, "files": files})
+}
+
+type episodeSchedule struct {
+	counts map[int]int
+	dates  []model.EpisodeAirDate
+}
+
+// patchCatalogMetadata updates only fields owned by catalog enrichment. The
+// stored record is loaded while UpdateMedia holds the store lock, so a newer
+// Work lease, status, request association, or durable intent is retained.
+func (h *Handler) patchCatalogMetadata(snapshot *model.Media, details service.CatalogDetails, schedule *episodeSchedule) (*model.Media, bool) {
+	if snapshot == nil {
+		return nil, false
+	}
+	updated, err := h.Store.UpdateMedia(snapshot.ID, func(current *model.Media) error {
+		if current.Type != snapshot.Type || current.TMDBID != snapshot.TMDBID {
+			// The original item was deleted and its local ID reused. A GET must
+			// not recreate or enrich a different media record.
+			return os.ErrNotExist
+		}
+		current.Overview = details.Overview
+		current.PosterPath = details.PosterPath
+		current.BackdropPath = details.BackdropPath
+		if schedule != nil {
+			// Episode counts and dates are a single scheduling unit. Publish both
+			// only after the complete EpisodeSchedule request succeeded.
+			current.EpisodeCounts = schedule.counts
+			current.EpisodeAirDates = schedule.dates
+		}
+		return nil
+	})
+	if err == nil {
+		return updated, true
+	}
+	if !errors.Is(err, os.ErrNotExist) && h.Log != nil {
+		h.Log.Warn("catalog metadata refresh unavailable", "media", snapshot.ID, "error", err)
+	}
+	return nil, false
 }
 
 func catalogFromMedia(media *model.Media) service.CatalogDetails {
@@ -280,8 +336,11 @@ func (h *Handler) mediaPoster(w http.ResponseWriter, r *http.Request) {
 	}
 	if media.PosterPath == "" && media.TMDBID > 0 {
 		if details, err := h.Seerr.Catalog(r.Context(), media.Type, media.TMDBID); err == nil {
-			media.Overview, media.PosterPath, media.BackdropPath = details.Overview, details.PosterPath, details.BackdropPath
-			_ = h.Store.UpsertMedia(media)
+			media, ok = h.patchPosterMetadata(media, details)
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
 		}
 	}
 	if media.PosterPath == "" || !strings.HasPrefix(media.PosterPath, "/") {
@@ -291,13 +350,45 @@ func (h *Handler) mediaPoster(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "https://image.tmdb.org/t/p/w500"+media.PosterPath, http.StatusFound)
 }
 
+// patchPosterMetadata deliberately fills only the missing poster field. The
+// fallback is a GET convenience and must not overwrite newer catalog metadata
+// or any resolver-owned lifecycle state.
+func (h *Handler) patchPosterMetadata(snapshot *model.Media, details service.CatalogDetails) (*model.Media, bool) {
+	if snapshot == nil {
+		return nil, false
+	}
+	updated, err := h.Store.UpdateMedia(snapshot.ID, func(current *model.Media) error {
+		if current.Type != snapshot.Type || current.TMDBID != snapshot.TMDBID {
+			return os.ErrNotExist
+		}
+		if current.PosterPath == "" {
+			current.PosterPath = details.PosterPath
+		}
+		return nil
+	})
+	if err == nil {
+		return updated, true
+	}
+	if !errors.Is(err, os.ErrNotExist) && h.Log != nil {
+		h.Log.Warn("poster metadata refresh unavailable", "media", snapshot.ID, "error", err)
+	}
+	return nil, false
+}
+
 func (h *Handler) resetMedia(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		writeError(w, http.StatusBadRequest, errors.New("invalid media id"))
 		return
 	}
-	item, err := h.Store.ResetMedia(id)
+	if h.Resolver == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("media resolver is unavailable"))
+		return
+	}
+	// QueueReset derives the current record and unmarks its request markers in
+	// the same durable transaction. Do not snapshot/reset/queue separately:
+	// a resolver completion between those steps would otherwise be overwritten.
+	queued, err := h.Resolver.QueueReset(id)
 	if errors.Is(err, os.ErrNotExist) {
 		writeError(w, http.StatusNotFound, errors.New("media item not found"))
 		return
@@ -306,21 +397,8 @@ func (h *Handler) resetMedia(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	go func() {
-		var err error
-		if item.RequestID > 0 {
-			err = h.Seerr.Retry(context.Background(), item)
-		} else {
-			if h.Seerr != nil {
-				_ = h.Seerr.RefreshEpisodeCounts(context.Background(), item)
-			}
-			err = h.Resolver.Resolve(context.Background(), item)
-		}
-		if err != nil && h.Log != nil {
-			h.Log.Error("dashboard retry failed", "media", item.ID, "error", err)
-		}
-	}()
-	writeJSON(w, http.StatusAccepted, map[string]any{"media": item})
+	h.wakeScheduler()
+	writeJSON(w, http.StatusAccepted, map[string]any{"media": queued})
 }
 
 type rerequestInput struct {
@@ -338,41 +416,31 @@ func (h *Handler) rerequestMedia(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &input); err != nil {
 		return
 	}
-	item, ok := h.Store.MediaByID(id)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("media item not found"))
-		return
-	}
-	if item.Type != "tv" || input.Season <= 0 || input.Episode < 0 || !containsInt(item.Seasons, input.Season) {
+	if input.Season <= 0 || input.Episode < 0 {
 		writeError(w, http.StatusBadRequest, errors.New("choose a tracked TV season and optional episode"))
-		return
-	}
-	if count := item.EpisodeCounts[input.Season]; input.Episode > 0 && count > 0 && input.Episode > count {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("episode %d is outside season %d", input.Episode, input.Season))
-		return
-	}
-	if item.Status == "queued" || item.Status == "scraping" || item.Status == "resolving" {
-		writeError(w, http.StatusConflict, errors.New("wait for active resolution to finish before re-requesting"))
 		return
 	}
 	if h.Resolver == nil {
 		writeError(w, http.StatusServiceUnavailable, errors.New("media resolver is unavailable"))
 		return
 	}
-	item.Status = "queued"
-	item.Error = ""
-	item.ScrapedAt = time.Time{}
-	item.UpdatedAt = time.Now().UTC()
-	if err := h.Store.UpsertMedia(item); err != nil {
+	// Validation and queueing both run against the current stored record. A
+	// stale handler snapshot must not recreate a record that was just deleted.
+	queued, err := h.Resolver.QueueExistingRerequest(id, input.Season, input.Episode)
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, errors.New("media item not found"))
+		return
+	}
+	if errors.Is(err, service.ErrInvalidRerequestScope) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"media": item, "season": input.Season, "episode": input.Episode})
-	go func() {
-		if err := h.Resolver.Rerequest(context.Background(), item, input.Season, input.Episode); err != nil && h.Log != nil {
-			h.Log.Error("dashboard re-request failed", "media", item.ID, "season", input.Season, "episode", input.Episode, "error", err)
-		}
-	}()
+	h.wakeScheduler()
+	writeJSON(w, http.StatusAccepted, map[string]any{"media": queued, "season": input.Season, "episode": input.Episode})
 }
 
 func (h *Handler) deleteMedia(w http.ResponseWriter, r *http.Request) {
@@ -381,16 +449,16 @@ func (h *Handler) deleteMedia(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("invalid media id"))
 		return
 	}
-	media, ok := h.Store.MediaByID(id)
-	if !ok {
+	// DeleteInactiveMedia validates current durable work and removes media/files
+	// while holding one store transaction. A reset or re-request that wins the
+	// race therefore becomes a conflict rather than being deleted afterward.
+	if err := h.Store.DeleteInactiveMedia(id); errors.Is(err, os.ErrNotExist) {
 		writeError(w, http.StatusNotFound, errors.New("media item not found"))
 		return
-	}
-	if media.Status == "queued" || media.Status == "scraping" || media.Status == "resolving" {
+	} else if errors.Is(err, store.ErrMediaActive) {
 		writeError(w, http.StatusConflict, errors.New("wait for active resolution to finish before deleting"))
 		return
-	}
-	if err := h.Store.DeleteMedia(id); err != nil {
+	} else if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -420,13 +488,9 @@ func detailFiles(files []*model.File) []detailFile {
 	return out
 }
 
-func (h *Handler) resolveDirect(item *model.Media) {
-	if _, loaded := h.direct.LoadOrStore(item.ID, struct{}{}); loaded {
-		return
-	}
-	defer h.direct.Delete(item.ID)
-	if err := h.Resolver.Resolve(context.Background(), item); err != nil && h.Log != nil {
-		h.Log.Error("direct media request failed", "media", item.ID, "error", err)
+func (h *Handler) wakeScheduler() {
+	if h.Scheduler != nil {
+		h.Scheduler.Wake()
 	}
 }
 

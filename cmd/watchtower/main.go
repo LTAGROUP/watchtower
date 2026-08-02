@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -65,17 +66,23 @@ func main() {
 		}
 		return &scraper.Aggregator{Addons: addons, Client: apiClient, Log: log, RateLimitGuard: scraperGuard}, nil
 	}
-	plex := &service.Plex{Config: cfg, Settings: settings.Snapshot, Client: apiClient, Log: log}
+	plex := &service.Plex{Config: cfg, Settings: settings.Snapshot, Store: st, Client: apiClient, Log: log}
 	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, ResolutionConcurrency: cfg.ResolutionConcurrency, LibraryChanged: plex.Notify, Log: log}
+	lifecycle := &service.Lifecycle{Store: st, Resolver: resolver, Log: log}
 	streamClient := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}, Timeout: 0}
 	streamer := &service.Streamer{Store: st, Settings: settings.Snapshot, ProviderFactory: providerFactory, Repair: resolver.Repair, Client: streamClient, TTL: cfg.StreamURLTTL, Log: log}
-	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Client: apiClient, Log: log}
+	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Scheduler: lifecycle, Client: apiClient, Log: log}
+	resolver.WorkCompleted = func() {
+		lifecycle.Wake()
+		seerr.Wake()
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/dav/", &dav.Handler{Store: st, Streamer: streamer, Prefix: "/dav"})
 	mux.Handle("/dav", &dav.Handler{Store: st, Streamer: streamer, Prefix: "/dav"})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"status": "ok", "files": len(st.Files())})
 	})
+	mux.HandleFunc("GET /readyz", readinessHandler(settings, st))
 	mux.HandleFunc("GET /api/v1/library", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"media": st.Media(), "files": st.Files()})
@@ -84,9 +91,12 @@ func main() {
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: requestLog(log, mux), ReadHeaderTimeout: 10 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go seerr.Run(ctx)
-	go plex.Run(ctx)
-	dashboardHandler := (&dashboard.Handler{Store: st, Settings: settings, Resolver: resolver, Seerr: seerr, Username: cfg.DashboardUsername, Password: cfg.DashboardPassword, Log: log, Logs: logs}).Routes()
+	var serviceTasks sync.WaitGroup
+	serviceTasks.Add(3)
+	go func() { defer serviceTasks.Done(); lifecycle.Run(ctx) }()
+	go func() { defer serviceTasks.Done(); seerr.Run(ctx) }()
+	go func() { defer serviceTasks.Done(); plex.Run(ctx) }()
+	dashboardHandler := (&dashboard.Handler{Store: st, Settings: settings, Resolver: resolver, Seerr: seerr, Scheduler: lifecycle, Username: cfg.DashboardUsername, Password: cfg.DashboardPassword, Log: log, Logs: logs}).Routes()
 	dashboardServer := &http.Server{Addr: cfg.DashboardAddr, Handler: requestLog(log, dashboardHandler), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		log.Info("listening", "address", cfg.ListenAddr)
@@ -107,6 +117,40 @@ func main() {
 	defer cancelShutdown()
 	_ = server.Shutdown(shutdown)
 	_ = dashboardServer.Shutdown(shutdown)
+	servicesStopped := make(chan struct{})
+	go func() {
+		serviceTasks.Wait()
+		close(servicesStopped)
+	}()
+	select {
+	case <-servicesStopped:
+	case <-shutdown.Done():
+		log.Warn("service shutdown timed out", "error", shutdown.Err())
+	}
+}
+
+// readinessHandler is intentionally non-probing. /healthz is the Compose
+// liveness endpoint; readiness only reflects the live validated settings and
+// whether the durable store opened successfully.
+func readinessHandler(settings *config.Manager, st *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		errors := make([]string, 0)
+		if settings == nil {
+			errors = append(errors, "settings are unavailable")
+		} else {
+			errors = append(errors, settings.Snapshot().Validate()...)
+		}
+		if st == nil {
+			errors = append(errors, "store is unavailable")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if len(errors) > 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "not_ready", "errors": errors})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ready", "files": len(st.Files())})
+	}
 }
 
 func colorLogs() bool {
@@ -122,7 +166,7 @@ func requestLog(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		if r.URL.Path != "/healthz" && r.URL.Path != "/api/v1/logs" {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && r.URL.Path != "/api/v1/logs" {
 			log.Info("request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start).String())
 		}
 	})

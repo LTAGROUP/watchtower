@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -118,6 +120,147 @@ func TestResolverLimitsConcurrentResolutions(t *testing.T) {
 	case <-acquired:
 	case <-time.After(time.Second):
 		t.Fatal("second resolution did not acquire the released slot")
+	}
+}
+
+func TestFinishResolutionPublishesFilesWithoutOverwritingNewerWork(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseUntil := time.Now().UTC().Add(time.Minute).Round(0)
+	availability := model.DurableIntent{Generation: 4, CompletedGeneration: 2, Attempts: 3, NextAt: time.Now().UTC().Add(time.Hour).Round(0), LeaseGeneration: 4, LeaseUntil: time.Now().UTC().Add(2 * time.Hour).Round(0)}
+	initial := &model.Media{
+		ID: 301, RequestID: 501, RequestIDs: []int64{501}, SeerrMediaID: 9001,
+		Type: "tv", TMDBID: 7001, Title: "Original", Status: "resolving",
+		Seasons: []int{1}, EpisodeCounts: map[int]int{1: 2},
+		Work:               model.MediaWork{Mode: workModeResolve, Generation: 1, Attempts: 2, LeaseUntil: leaseUntil},
+		PlexIntent:         model.DurableIntent{Generation: 7, CompletedGeneration: 3, Attempts: 2, NextAt: time.Now().UTC().Add(time.Hour).Round(0), LeaseGeneration: 7, LeaseUntil: time.Now().UTC().Add(2 * time.Hour).Round(0)},
+		AvailabilityIntent: availability,
+	}
+	if err := state.UpsertMedia(initial); err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := state.MediaByID(initial.ID)
+	if !ok {
+		t.Fatal("missing claimed media")
+	}
+	worker.Status = "ready"
+	worker.Error = ""
+	worker.ScrapedAt = time.Now().UTC()
+
+	resolver := &Resolver{Config: config.Config{PlexScanDelay: 20 * time.Millisecond}, Store: state}
+	var queueErr error
+	resolver.beforeFinishResolution = func() {
+		resolver.beforeFinishResolution = nil
+		_, queueErr = resolver.QueueRerequest(&model.Media{
+			ID: initial.ID, RequestID: 502, RequestIDs: []int64{502}, SeerrMediaID: 9002,
+			Type: "tv", TMDBID: initial.TMDBID, Title: "N+1 catalog", Overview: "new catalog data",
+			Seasons: []int{1}, EpisodeCounts: map[int]int{1: 2},
+		}, 1, 2)
+	}
+	oldFile := &model.File{ID: "old-worker-file", MediaID: initial.ID, Path: "TV/Original/Season 01/Original - S01E01 [1080p].mkv", Quality: "1080p", Provider: "test"}
+	if err := resolver.finishResolution(worker, []*model.File{oldFile}, true, true, time.Time{}, false); err != nil {
+		t.Fatal(err)
+	}
+	if queueErr != nil {
+		t.Fatalf("queue N+1: %v", queueErr)
+	}
+
+	updated, _ := state.MediaByID(initial.ID)
+	wantWork := model.MediaWork{Mode: workModeRerequest, Season: 1, Episode: 2, Generation: 2}
+	if updated.Work != wantWork || updated.Status != "queued" || updated.Error != "" {
+		t.Fatalf("old result replaced N+1 work: media=%#v", updated)
+	}
+	if worker.Work != wantWork || worker.Status != "queued" {
+		t.Fatalf("finishResolution did not return current N+1 media to caller: %#v", worker)
+	}
+	if updated.Title != "N+1 catalog" || updated.Overview != "new catalog data" || updated.SeerrMediaID != 9002 || len(updated.RequestIDs) != 2 {
+		t.Fatalf("old result replaced current catalog/request state: %#v", updated)
+	}
+	if updated.AvailabilityIntent != availability {
+		t.Fatalf("old result replaced current availability intent: %#v", updated.AvailabilityIntent)
+	}
+	if updated.PlexIntent.Generation != 8 || updated.PlexIntent.CompletedGeneration != 3 || updated.PlexIntent.Attempts != 0 || updated.PlexIntent.LeaseGeneration != 0 || !updated.PlexIntent.LeaseUntil.IsZero() || updated.PlexIntent.NextAt.IsZero() {
+		t.Fatalf("file publication did not advance Plex intent from current state: %#v", updated.PlexIntent)
+	}
+	files := state.FilesForMedia(initial.ID)
+	if len(files) != 1 || files[0].ID != oldFile.ID {
+		t.Fatalf("old worker did not publish useful resolved file: %#v", files)
+	}
+}
+
+func TestQueueResetAtomicallyRequeuesCurrentMediaAndUnmarksRequests(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{
+		ID: 302, RequestID: 501, RequestIDs: []int64{502, 503}, SeerrMediaID: 9003,
+		Type: "movie", TMDBID: 7002, Title: "Current catalog", Overview: "preserve this",
+		Status: "failed", Error: "provider unavailable", ScrapedAt: time.Now().UTC(),
+		Work:               model.MediaWork{Mode: workModeRerequest, Season: 1, Generation: 8, Attempts: 2, NextAt: time.Now().UTC().Add(time.Hour)},
+		PlexIntent:         model.DurableIntent{Generation: 3, CompletedGeneration: 2},
+		AvailabilityIntent: model.DurableIntent{Generation: 4, CompletedGeneration: 1},
+	}
+	if err := state.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Commit(store.Mutation{MarkProcessed: []int64{501, 502, 503}}); err != nil {
+		t.Fatal(err)
+	}
+
+	queued, err := (&Resolver{Store: state}).QueueReset(media.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Work != (model.MediaWork{Mode: workModeResolve, Generation: 9}) || queued.Status != "queued" || queued.Error != "" || !queued.ScrapedAt.IsZero() {
+		t.Fatalf("reset did not create fresh durable work: %#v", queued)
+	}
+	if queued.Title != media.Title || queued.Overview != media.Overview || queued.SeerrMediaID != media.SeerrMediaID || queued.PlexIntent != media.PlexIntent || queued.AvailabilityIntent != media.AvailabilityIntent {
+		t.Fatalf("reset replaced current non-lifecycle state: %#v", queued)
+	}
+	for _, requestID := range []int64{501, 502, 503} {
+		if state.IsProcessed(requestID) {
+			t.Fatalf("reset retained processed request %d", requestID)
+		}
+	}
+	if _, err := (&Resolver{Store: state}).QueueReset(999); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing reset error = %v, want not exist", err)
+	}
+}
+
+func TestQueueExistingRerequestDoesNotRecreateDeletedMedia(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{
+		ID: 303, Type: "tv", TMDBID: 7003, Title: "Tracked", Status: "ready",
+		Seasons: []int{1}, EpisodeCounts: map[int]int{1: 2}, Work: model.MediaWork{Generation: 6},
+	}
+	if err := state.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &Resolver{Store: state}
+	queued, err := resolver.QueueExistingRerequest(media.ID, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Work != (model.MediaWork{Mode: workModeRerequest, Season: 1, Episode: 2, Generation: 7}) || queued.Status != "queued" {
+		t.Fatalf("existing re-request was not atomically queued: %#v", queued)
+	}
+	if _, err := resolver.QueueExistingRerequest(media.ID, 2, 1); !errors.Is(err, ErrInvalidRerequestScope) {
+		t.Fatalf("invalid scope error = %v, want ErrInvalidRerequestScope", err)
+	}
+	if err := state.DeleteMedia(media.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.QueueExistingRerequest(media.ID, 1, 2); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted existing ID error = %v, want not exist", err)
+	}
+	if _, ok := state.MediaByID(media.ID); ok {
+		t.Fatal("known deleted media was recreated by existing-ID queue")
 	}
 }
 

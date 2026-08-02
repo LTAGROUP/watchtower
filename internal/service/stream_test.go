@@ -47,6 +47,12 @@ type rateLimitedLinkProvider struct {
 	calls int
 }
 
+type streamRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip streamRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
 type disconnectWriter struct {
 	header http.Header
 	status int
@@ -193,6 +199,90 @@ func TestStreamerConvertsRepeatedProviderErrorsToBadGateway(t *testing.T) {
 	}
 	if provider.calls != 3 {
 		t.Fatalf("expected 3 URL refreshes, got %d", provider.calls)
+	}
+}
+
+func TestStreamerRejectsNonHTTPProviderURLs(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		url  string
+	}{
+		{name: "malformed", url: "://signed-provider.example/stream?token=malformed-secret"},
+		{name: "relative", url: "/stream?token=relative-secret"},
+		{name: "ftp", url: "ftp://signed-provider.example/stream?token=ftp-secret"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st, err := store.Open(t.TempDir() + "/state.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test"}
+			if err = st.AddFiles(file); err != nil {
+				t.Fatal(err)
+			}
+			provider := &rotatingProvider{url: test.url}
+			var logs bytes.Buffer
+			streamer := &Streamer{
+				Store: st, Providers: map[string]debrid.Provider{"test": provider},
+				TTL: time.Hour, RetryBackoff: time.Nanosecond,
+				Log: slog.New(slog.NewJSONHandler(&logs, nil)),
+			}
+			recorder := httptest.NewRecorder()
+			streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("expected 502, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+			if provider.calls != 3 {
+				t.Fatalf("expected three bounded URL attempts, got %d", provider.calls)
+			}
+			if strings.Contains(recorder.Body.String(), test.url) || strings.Contains(logs.String(), test.url) || strings.Contains(recorder.Body.String(), "secret") || strings.Contains(logs.String(), "secret") {
+				t.Fatalf("provider URL leaked into response or logs: response=%s logs=%s", recorder.Body.String(), logs.String())
+			}
+			cached, _ := st.File(file.ID)
+			if cached.StreamURL != "" {
+				t.Fatalf("invalid provider URL was cached: %#v", cached.StreamURL)
+			}
+		})
+	}
+}
+
+func TestStreamerSanitizesTransportErrors(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test"}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	signedURL := "https://signed-provider.example/stream?token=transport-secret"
+	provider := &rotatingProvider{url: signedURL}
+	transportCalls := 0
+	client := &http.Client{Transport: streamRoundTripper(func(*http.Request) (*http.Response, error) {
+		transportCalls++
+		return nil, fmt.Errorf("transport private detail for %s", signedURL)
+	})}
+	var logs bytes.Buffer
+	streamer := &Streamer{
+		Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: client,
+		TTL: time.Hour, RetryBackoff: time.Nanosecond,
+		Log: slog.New(slog.NewJSONHandler(&logs, nil)),
+	}
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if provider.calls != 3 || transportCalls != 3 {
+		t.Fatalf("expected three bounded transport attempts, provider=%d transport=%d", provider.calls, transportCalls)
+	}
+	for _, secret := range []string{signedURL, "transport private detail"} {
+		if strings.Contains(recorder.Body.String(), secret) || strings.Contains(logs.String(), secret) {
+			t.Fatalf("transport detail leaked into response or logs: response=%s logs=%s", recorder.Body.String(), logs.String())
+		}
+	}
+	if !strings.Contains(recorder.Body.String(), errProviderStreamUnavailable.Error()) || !strings.Contains(logs.String(), errProviderStreamUnavailable.Error()) {
+		t.Fatalf("transport failure was not sanitized: response=%s logs=%s", recorder.Body.String(), logs.String())
 	}
 }
 

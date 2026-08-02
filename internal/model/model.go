@@ -3,8 +3,12 @@ package model
 import "time"
 
 type Media struct {
-	ID            int64       `json:"id"`
-	RequestID     int64       `json:"requestId"`
+	ID        int64 `json:"id"`
+	RequestID int64 `json:"requestId"`
+	// RequestIDs retains every Seerr request collapsed into this media item.
+	// RequestID remains the original compatibility field.
+	RequestIDs    []int64     `json:"requestIds,omitempty"`
+	SeerrMediaID  int64       `json:"seerrMediaId,omitempty"`
 	Type          string      `json:"type"`
 	TMDBID        int64       `json:"tmdbId"`
 	ExternalID    string      `json:"externalId"`
@@ -21,6 +25,46 @@ type Media struct {
 	CreatedAt     time.Time   `json:"createdAt"`
 	UpdatedAt     time.Time   `json:"updatedAt"`
 	ScrapedAt     time.Time   `json:"scrapedAt,omitempty"`
+	// Work is a single, durable resolution command. An empty Mode means there
+	// is no pending work. It deliberately lives on Media instead of in a
+	// general-purpose jobs collection so legacy state remains readable.
+	Work               MediaWork        `json:"work,omitempty"`
+	EpisodeAirDates    []EpisodeAirDate `json:"episodeAirDates,omitempty"`
+	PlexIntent         DurableIntent    `json:"plexIntent,omitempty"`
+	AvailabilityIntent DurableIntent    `json:"availabilityIntent,omitempty"`
+}
+
+// MediaWork describes a full resolution or a scoped TV re-request. NextAt and
+// LeaseUntil are UTC timestamps. A non-expired lease prevents another worker
+// from executing the same durable command after it has been claimed.
+type MediaWork struct {
+	Mode       string    `json:"mode,omitempty"`
+	Season     int       `json:"season,omitempty"`
+	Episode    int       `json:"episode,omitempty"`
+	Generation int64     `json:"generation,omitempty"`
+	Attempts   int       `json:"attempts,omitempty"`
+	NextAt     time.Time `json:"nextAt,omitempty"`
+	LeaseUntil time.Time `json:"leaseUntil,omitempty"`
+}
+
+// EpisodeAirDate is intentionally a flat value record. It keeps state JSON
+// friendly and avoids a nested map that callers could accidentally retain.
+type EpisodeAirDate struct {
+	Season  int    `json:"season"`
+	Episode int    `json:"episode"`
+	AirDate string `json:"airDate"`
+}
+
+// DurableIntent tracks a versioned external side effect. A completion may only
+// acknowledge the generation it observed; a newer Generation therefore remains
+// pending after an older request succeeds.
+type DurableIntent struct {
+	Generation          int64     `json:"generation,omitempty"`
+	CompletedGeneration int64     `json:"completedGeneration,omitempty"`
+	Attempts            int       `json:"attempts,omitempty"`
+	NextAt              time.Time `json:"nextAt,omitempty"`
+	LeaseUntil          time.Time `json:"leaseUntil,omitempty"`
+	LeaseGeneration     int64     `json:"leaseGeneration,omitempty"`
 }
 
 type QualityAvailability struct {

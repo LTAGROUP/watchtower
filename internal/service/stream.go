@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,12 @@ type streamRefresh struct {
 	err  error
 }
 
+var (
+	errInvalidProviderStreamURL  = errors.New("invalid provider stream URL")
+	errProviderStreamUnavailable = errors.New("provider stream unavailable")
+	errProviderStreamRateLimited = errors.New("provider stream rate limited")
+)
+
 func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) {
 	const maxAttempts = 3
 	started := time.Now()
@@ -54,12 +61,13 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 					delay = 30 * time.Second
 				}
 				w.Header().Set("Retry-After", retryAfterHeader(delay))
-				http.Error(w, e.Error(), http.StatusTooManyRequests)
+				http.Error(w, streamSafeError(e).Error(), http.StatusTooManyRequests)
 				return
 			}
-			willRetry := (errors.Is(e, debrid.ErrTransient) || errors.Is(e, debrid.ErrProviderUnavailable)) && attempt+1 < maxAttempts
+			willRetry := retryableStreamLinkError(e) && attempt+1 < maxAttempts
+			safeErr := streamSafeError(e)
 			if s.Log != nil {
-				attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt + 1, "will_retry", willRetry, "error", e}
+				attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt + 1, "will_retry", willRetry, "error", safeErr}
 				if willRetry {
 					s.Log.Warn("stream link temporarily unavailable", attrs...)
 				} else {
@@ -72,33 +80,52 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 				}
 				continue
 			}
-			http.Error(w, e.Error(), http.StatusBadGateway)
+			http.Error(w, safeErr.Error(), http.StatusBadGateway)
 			return
 		}
-		req, _ := http.NewRequestWithContext(r.Context(), r.Method, u, nil)
-		for _, h := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "User-Agent"} {
-			req.Header.Set(h, r.Header.Get(h))
-		}
-		resp, e := s.Client.Do(req)
-		if e != nil {
+		req, reqErr := http.NewRequestWithContext(r.Context(), r.Method, u, nil)
+		if reqErr != nil {
+			// Keep provider-generated URLs out of logs and response bodies. The
+			// error returned by net/http includes the rejected URL, which may
+			// contain signed credentials.
+			requestErr := errInvalidProviderStreamURL
 			if s.Log != nil {
-				s.Log.Warn("stream upstream request failed", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "will_refresh", attempt+1 < maxAttempts, "error", e)
+				s.Log.Warn("stream upstream request failed", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "will_refresh", attempt+1 < maxAttempts, "error", requestErr)
 			}
 			if attempt+1 < maxAttempts {
 				continue
 			}
-			http.Error(w, e.Error(), http.StatusBadGateway)
+			http.Error(w, requestErr.Error(), http.StatusBadGateway)
+			return
+		}
+		for _, h := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "User-Agent"} {
+			req.Header.Set(h, r.Header.Get(h))
+		}
+		client := s.Client
+		if client == nil {
+			client = http.DefaultClient
+		}
+		resp, e := client.Do(req)
+		if e != nil {
+			transportErr := errProviderStreamUnavailable
+			if s.Log != nil {
+				s.Log.Warn("stream upstream request failed", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "will_refresh", attempt+1 < maxAttempts, "error", transportErr)
+			}
+			if attempt+1 < maxAttempts {
+				continue
+			}
+			http.Error(w, transportErr.Error(), http.StatusBadGateway)
 			return
 		}
 		if retryableStatus(resp.StatusCode) {
 			resp.Body.Close()
 			if s.Log != nil {
-				s.Log.Warn("stream link rejected by upstream", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "status", resp.Status, "will_refresh", attempt+1 < maxAttempts)
+				s.Log.Warn("stream link rejected by upstream", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "status", resp.StatusCode, "will_refresh", attempt+1 < maxAttempts)
 			}
 			if attempt+1 < maxAttempts {
 				continue
 			}
-			http.Error(w, fmt.Sprintf("provider stream unavailable after %d attempts (%s)", maxAttempts, resp.Status), http.StatusBadGateway)
+			http.Error(w, fmt.Sprintf("provider stream unavailable after %d attempts", maxAttempts), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
@@ -116,9 +143,9 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			written, e = io.Copy(w, resp.Body)
 		}
 		if s.Log != nil {
-			attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.Status, "bytes", written, "attempts", attempt + 1, "duration", time.Since(started).String()}
+			attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.StatusCode, "bytes", written, "attempts", attempt + 1, "duration", time.Since(started).String()}
 			if e != nil {
-				attrs = append(attrs, "error", e)
+				attrs = append(attrs, "error", errProviderStreamUnavailable)
 				if clientClosedConnection(r.Context(), e) {
 					s.Log.Debug("stream transfer canceled by client", attrs...)
 				} else {
@@ -171,6 +198,34 @@ func retryableStatus(status int) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests ||
 		status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status >= 500
 }
+
+func retryableStreamLinkError(err error) bool {
+	return errors.Is(err, debrid.ErrTransient) || errors.Is(err, debrid.ErrProviderUnavailable) || errors.Is(err, errInvalidProviderStreamURL)
+}
+
+func streamSafeError(err error) error {
+	switch {
+	case errors.Is(err, errInvalidProviderStreamURL):
+		return errInvalidProviderStreamURL
+	case errors.Is(err, debrid.ErrRateLimited):
+		return errProviderStreamRateLimited
+	default:
+		return errProviderStreamUnavailable
+	}
+}
+
+func validProviderStreamURL(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil {
+		return "", errInvalidProviderStreamURL
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "http" && scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" {
+		return "", errInvalidProviderStreamURL
+	}
+	return parsed.String(), nil
+}
+
 func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, error) {
 	s.mu.Lock()
 	current, attached := s.Store.File(f.ID)
@@ -182,13 +237,14 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		}
 	}
 	if !force && current.StreamURL != "" && time.Now().Before(current.StreamExpiresAt) {
-		u := current.StreamURL
-		expiresAt := current.StreamExpiresAt
-		s.mu.Unlock()
-		if s.Log != nil {
-			s.Log.Debug("using cached stream link", "component", "stream", "file", current.Path, "provider", current.Provider, "expires_in", time.Until(expiresAt).Round(time.Second).String())
+		if u, err := validProviderStreamURL(current.StreamURL); err == nil {
+			expiresAt := current.StreamExpiresAt
+			s.mu.Unlock()
+			if s.Log != nil {
+				s.Log.Debug("using cached stream link", "component", "stream", "file", current.Path, "provider", current.Provider, "expires_in", time.Until(expiresAt).Round(time.Second).String())
+			}
+			return u, nil
 		}
-		return u, nil
 	}
 	if until := s.rateLimitedUntil[current.Provider]; time.Now().Before(until) {
 		s.mu.Unlock()
@@ -259,7 +315,7 @@ func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached
 	u, e := p.StreamURL(ctx, current)
 	if errors.Is(e, debrid.ErrStaleItem) && s.Repair != nil && attached {
 		if s.Log != nil {
-			s.Log.Warn("stream source is stale; attempting automatic repair", "component", "stream", "file", current.Path, "provider", current.Provider, "error", e)
+			s.Log.Warn("stream source is stale; attempting automatic repair", "component", "stream", "file", current.Path, "provider", current.Provider)
 		}
 		repaired, repairErr := s.Repair(ctx, current)
 		if repairErr != nil {
@@ -281,7 +337,14 @@ func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached
 	}
 	if e != nil {
 		if s.Log != nil {
-			s.Log.Warn("stream link refresh failed", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason, "error", e)
+			s.Log.Warn("stream link refresh failed", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason, "error", streamSafeError(e))
+		}
+		return "", e
+	}
+	u, e = validProviderStreamURL(u)
+	if e != nil {
+		if s.Log != nil {
+			s.Log.Warn("stream link refresh failed", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason, "error", errInvalidProviderStreamURL)
 		}
 		return "", e
 	}
