@@ -110,6 +110,7 @@
       <section class="page" id="queue-page">
         <div class="section-intro row"><div><h2>Resolution queue</h2><p>Review active, partial, and failed work until each title is ready.</p></div><button class="button ghost" id="retry-failed">Retry all failed</button></div>
         <div class="queue-toolbar">
+          <label class="queue-status-filter"><span>Status</span><select id="queue-status"><option value="all">All statuses</option><option value="queued">Queued</option><option value="scraping">Scraping</option><option value="resolving">Resolving</option><option value="partial">Partial</option><option value="failed">Failed</option><option value="unreleased">Unreleased</option></select></label>
           <div class="segmented-control" aria-label="Filter queue by media type">
             <button class="active" type="button" data-queue-type="all" aria-pressed="true">All <span id="queue-all-count">0</span></button>
             <button type="button" data-queue-type="movie" aria-pressed="false">Movies <span id="queue-movie-count">0</span></button>

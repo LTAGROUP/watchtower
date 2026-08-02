@@ -109,6 +109,9 @@ func TestRateLimitGuardFailsFastDuringAddonCooldown(t *testing.T) {
 	if !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("expected rate-limit error, got %v", err)
 	}
+	if !IsRateLimitCooldown(err) {
+		t.Fatalf("expected cooldown-specific error, got %v", err)
+	}
 	if time.Since(started) > 100*time.Millisecond {
 		t.Fatalf("addon cooldown check blocked instead of failing fast")
 	}

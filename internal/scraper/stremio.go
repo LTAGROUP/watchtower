@@ -69,7 +69,7 @@ func (g *RateLimitGuard) Wait(ctx context.Context, addon string) error {
 	delay := g.blockedUntil[addon].Sub(time.Now())
 	g.mu.Unlock()
 	if delay > 0 {
-		return fmt.Errorf("%s: %w (cooldown active; retry after %s)", addon, ErrRateLimited, formatCooldown(delay))
+		return &RateLimitCooldownError{Addon: addon, RetryAfter: delay}
 	}
 	return nil
 }
@@ -107,6 +107,22 @@ type stream struct {
 var sizeRE = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)\s*(gib|gb|mib|mb)`)
 var seedRE = regexp.MustCompile(`(?i)(?:👤\s*|seeders?\D*|seeds?\D*)([0-9]+)`)
 var ErrRateLimited = errors.New("scraper rate limited")
+
+type RateLimitCooldownError struct {
+	Addon      string
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitCooldownError) Error() string {
+	return fmt.Sprintf("%s: %s (cooldown active; retry after %s)", e.Addon, ErrRateLimited, formatCooldown(e.RetryAfter))
+}
+
+func (e *RateLimitCooldownError) Unwrap() error { return ErrRateLimited }
+
+func IsRateLimitCooldown(err error) bool {
+	var cooldown *RateLimitCooldownError
+	return errors.As(err, &cooldown)
+}
 
 func ParseAddons(values []string) ([]Addon, error) {
 	out := make([]Addon, 0, len(values))
@@ -180,7 +196,7 @@ func (a *Aggregator) Search(ctx context.Context, q Query, limit int) ([]model.Re
 			if errors.Is(result.err, ErrRateLimited) {
 				rateLimited = true
 			}
-			if a.Log != nil {
+			if a.Log != nil && !IsRateLimitCooldown(result.err) {
 				a.Log.Warn("scraper search failed", "component", "scraper", "addon", result.addon, "media_type", mediaType, "media_id", id, "error", result.err)
 			}
 			errs = append(errs, result.err.Error())

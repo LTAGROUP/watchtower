@@ -1,6 +1,6 @@
 const state = {
   route: 'dashboard', summary: null, media: [], files: [], queue: [], settings: null,
-  libraryTab: 'media', libraryType: 'all', queueType: 'all', detailCache: new Map(), detail: null,
+  libraryTab: 'media', libraryType: 'all', queueType: 'all', queueStatus: 'all', detailCache: new Map(), detail: null,
   discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true },
   logs: { entries: [], capacity: 0, loading: false }
 };
@@ -116,12 +116,14 @@ function renderQueue() {
   $('#queue-all-count').textContent = state.queue.length;
   $('#queue-movie-count').textContent = state.queue.filter(item => item.type === 'movie').length;
   $('#queue-tv-count').textContent = state.queue.filter(item => item.type === 'tv').length;
-  const filteredQueue = state.queue.filter(item => state.queueType === 'all' || item.type === state.queueType);
+  const filteredQueue = state.queue.filter(item => (state.queueType === 'all' || item.type === state.queueType) && (state.queueStatus === 'all' || item.status === state.queueStatus));
   const counts = {active:0, unreleased:0, partial:0, failed:0};
   filteredQueue.forEach(item => { if (['queued','scraping','resolving'].includes(item.status)) counts.active++; if (item.status === 'unreleased') counts.unreleased++; if (item.status === 'partial') counts.partial++; if (item.status === 'failed') counts.failed++; });
   $('#queue-summary').innerHTML = [['Active',counts.active],['Unreleased',counts.unreleased],['Partial',counts.partial],['Failed',counts.failed]].map(([label,value]) => `<div class="queue-stat"><strong>${value}</strong><small>${label}</small></div>`).join('');
   const list = [...filteredQueue].sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-  $('#queue-list').innerHTML = list.length ? list.map(item => `<article class="queue-card"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><h3>${escapeHTML(item.title)} ${item.year ? `<span class="muted">(${item.year})</span>` : ''}</h3><p>${item.status === 'unreleased' && item.releaseDate ? `Releases ${formatDate(item.releaseDate)} · WatchTower will retry automatically` : item.error ? escapeHTML(item.error) : `${item.seasons?.length ? `Seasons ${item.seasons.join(', ')} · ` : ''}updated ${timeAgo(item.updatedAt)}`}</p></div><div class="queue-actions"><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span>${item.status === 'unreleased' ? '' : `<button class="button ghost" data-reset-id="${item.id}">Retry</button>`}</div></article>`).join('') : '<div class="panel empty-state">No queue items match this media type.</div>';
+  const statusLabel = state.queueStatus === 'all' ? 'status' : state.queueStatus;
+  const emptyMessage = state.queueType === 'all' && state.queueStatus === 'all' ? 'No queue items.' : `No ${statusLabel} queue items match these filters.`;
+  $('#queue-list').innerHTML = list.length ? list.map(item => `<article class="queue-card"><span class="type-tile">${item.type === 'tv' ? 'TV' : 'M'}</span><div><h3>${escapeHTML(item.title)} ${item.year ? `<span class="muted">(${item.year})</span>` : ''}</h3><p>${item.status === 'unreleased' && item.releaseDate ? `Releases ${formatDate(item.releaseDate)} · WatchTower will retry automatically` : item.error ? escapeHTML(item.error) : `${item.seasons?.length ? `Seasons ${item.seasons.join(', ')} · ` : ''}updated ${timeAgo(item.updatedAt)}`}</p></div><div class="queue-actions"><span class="status ${escapeHTML(item.status)}">${escapeHTML(item.status)}</span>${item.status === 'unreleased' ? '' : `<button class="button ghost" data-reset-id="${item.id}">Retry</button>`}</div></article>`).join('') : `<div class="panel empty-state">${escapeHTML(emptyMessage)}</div>`;
 }
 
 async function loadLogs() {
@@ -516,6 +518,7 @@ $('#log-refresh').addEventListener('click', loadLogs);
 $$('[data-library-tab]').forEach(tab => tab.addEventListener('click', () => { state.libraryTab = tab.dataset.libraryTab; $$('[data-library-tab]').forEach(t => { t.classList.toggle('active', t === tab); t.setAttribute('aria-selected', String(t === tab)); }); renderLibrary(); }));
 $$('[data-library-type]').forEach(button => button.addEventListener('click', () => { state.libraryType = button.dataset.libraryType; $$('[data-library-type]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', String(item === button)); }); renderLibrary(); }));
 $$('[data-queue-type]').forEach(button => button.addEventListener('click', () => { state.queueType = button.dataset.queueType; $$('[data-queue-type]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', String(item === button)); }); renderQueue(); }));
+$('#queue-status').addEventListener('change', event => { state.queueStatus = event.target.value; renderQueue(); });
 $('#settings-form').addEventListener('submit', saveSettings);
 $('#settings-form').addEventListener('change', event => { if (event.target.matches('.choice-option input[type="checkbox"]')) updateChoiceOption(event.target); });
 $('#request-form').addEventListener('submit', submitRequest);
