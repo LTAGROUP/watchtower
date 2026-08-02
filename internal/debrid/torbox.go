@@ -21,11 +21,15 @@ type TorBox struct {
 	Client        *http.Client
 	AllowUncached bool
 	Poll          time.Duration
+	Guard         *TorBoxGuard
 }
 
 func (t *TorBox) Name() string { return "torbox" }
 func (t *TorBox) Resolve(ctx context.Context, r model.Release) (model.Resolved, error) {
-	if !t.AllowUncached && r.InfoHash != "" {
+	if !t.AllowUncached {
+		if strings.TrimSpace(r.InfoHash) == "" {
+			return model.Resolved{}, fmt.Errorf("cached-only resolution requires an info hash")
+		}
 		ok, err := t.cached(ctx, r.InfoHash)
 		if err != nil {
 			return model.Resolved{}, err
@@ -33,6 +37,9 @@ func (t *TorBox) Resolve(ctx context.Context, r model.Release) (model.Resolved, 
 		if !ok {
 			return model.Resolved{}, fmt.Errorf("not cached")
 		}
+	}
+	if err := t.waitRequest(ctx, "createtorrent", t.AllowUncached); err != nil {
+		return model.Resolved{}, err
 	}
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -53,6 +60,9 @@ func (t *TorBox) Resolve(ctx context.Context, r model.Release) (model.Resolved, 
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return model.Resolved{}, t.rateLimited("createtorrent", resp, string(b))
+	}
 	if resp.StatusCode/100 != 2 {
 		return model.Resolved{}, fmt.Errorf("torbox create: %s: %s", resp.Status, string(b))
 	}
@@ -70,6 +80,9 @@ func (t *TorBox) Resolve(ctx context.Context, r model.Release) (model.Resolved, 
 	return t.wait(ctx, id)
 }
 func (t *TorBox) cached(ctx context.Context, hash string) (bool, error) {
+	if err := t.waitRequest(ctx, "checkcached", false); err != nil {
+		return false, err
+	}
 	u := "https://api.torbox.app/v1/api/torrents/checkcached?format=object&list_files=true&hash=" + url.QueryEscape(hash)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	req.Header.Set("Authorization", "Bearer "+t.Token)
@@ -79,6 +92,9 @@ func (t *TorBox) cached(ctx context.Context, hash string) (bool, error) {
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return false, t.rateLimited("checkcached", resp, string(b))
+	}
 	if resp.StatusCode/100 != 2 {
 		return false, fmt.Errorf("torbox cache check: %s", resp.Status)
 	}
@@ -97,12 +113,20 @@ func (t *TorBox) wait(ctx context.Context, id int64) (model.Resolved, error) {
 		case <-ctx.Done():
 			return model.Resolved{}, ctx.Err()
 		case <-tick.C:
+			if err := t.waitRequest(ctx, "mylist", false); err != nil {
+				return model.Resolved{}, err
+			}
 			u := "https://api.torbox.app/v1/api/torrents/mylist?id=" + strconv.FormatInt(id, 10) + "&bypass_cache=true"
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 			req.Header.Set("Authorization", "Bearer "+t.Token)
 			resp, e := t.Client.Do(req)
 			if e != nil {
 				continue
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+				resp.Body.Close()
+				return model.Resolved{}, t.rateLimited("mylist", resp, string(body))
 			}
 			var raw map[string]any
 			e = json.NewDecoder(resp.Body).Decode(&raw)
@@ -135,6 +159,9 @@ func (t *TorBox) wait(ctx context.Context, id int64) (model.Resolved, error) {
 	}
 }
 func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
+	if err := t.waitRequest(ctx, "requestdl", false); err != nil {
+		return "", err
+	}
 	u := "https://api.torbox.app/v1/api/torrents/requestdl?token=" + url.QueryEscape(t.Token) + "&torrent_id=" + url.QueryEscape(f.ProviderItemID) + "&file_id=" + url.QueryEscape(f.ProviderFileID) + "&redirect=false"
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	resp, e := t.Client.Do(req)
@@ -150,7 +177,7 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 		return "", e
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", fmt.Errorf("%w: torbox request download returned %s: %s", ErrRateLimited, resp.Status, strings.TrimSpace(string(body)))
+		return "", t.rateLimited("requestdl", resp, string(body))
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 		return "", fmt.Errorf("%w: torbox download item returned %s", ErrStaleItem, resp.Status)
@@ -183,12 +210,27 @@ func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
 		return "", fmt.Errorf("%w: %s", ErrStaleItem, detail)
 	}
 	if strings.Contains(strings.ToLower(detail), "rate limit") {
-		return "", fmt.Errorf("%w: %s", ErrRateLimited, detail)
+		return "", t.rateLimited("requestdl", resp, detail)
 	}
 	if transientTorboxMessage(detail) {
 		return "", fmt.Errorf("%w: %s", ErrTransient, detail)
 	}
 	return "", fmt.Errorf("torbox returned no stream URL: %s", detail)
+}
+
+func (t *TorBox) waitRequest(ctx context.Context, endpoint string, uncachedCreate bool) error {
+	if t.Guard == nil {
+		return nil
+	}
+	return t.Guard.Wait(ctx, endpoint, uncachedCreate)
+}
+
+func (t *TorBox) rateLimited(endpoint string, resp *http.Response, detail string) error {
+	delay := retryAfter(resp.Header.Get("Retry-After"))
+	if t.Guard != nil {
+		t.Guard.Block(endpoint, delay)
+	}
+	return NewRateLimitError("torbox "+endpoint, delay, strings.TrimSpace(detail))
 }
 
 func transientHTTPStatus(status int) bool {

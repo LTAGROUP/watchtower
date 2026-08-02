@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +49,11 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		u, e := s.url(r.Context(), f, attempt > 0)
 		if e != nil {
 			if errors.Is(e, debrid.ErrRateLimited) {
-				w.Header().Set("Retry-After", "30")
+				delay := debrid.RateLimitDelay(e)
+				if delay <= 0 {
+					delay = 30 * time.Second
+				}
+				w.Header().Set("Retry-After", retryAfterHeader(delay))
 				http.Error(w, e.Error(), http.StatusTooManyRequests)
 				return
 			}
@@ -128,6 +133,17 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 	http.Error(w, "unable to refresh stream URL", http.StatusBadGateway)
 }
 
+func retryAfterHeader(delay time.Duration) string {
+	seconds := int(delay / time.Second)
+	if delay%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.Itoa(seconds)
+}
+
 func clientClosedConnection(ctx context.Context, err error) bool {
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return true
@@ -176,7 +192,7 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 	}
 	if until := s.rateLimitedUntil[current.Provider]; time.Now().Before(until) {
 		s.mu.Unlock()
-		return "", fmt.Errorf("%w: provider %q retry after %s", debrid.ErrRateLimited, current.Provider, time.Until(until).Round(time.Second))
+		return "", debrid.NewRateLimitError(current.Provider, time.Until(until), "cooldown active")
 	}
 	if s.refreshes == nil {
 		s.refreshes = map[string]*streamRefresh{}
@@ -201,7 +217,11 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 	s.mu.Lock()
 	delete(s.refreshes, current.ID)
 	if errors.Is(err, debrid.ErrRateLimited) {
-		s.rateLimitedUntil[current.Provider] = time.Now().Add(30 * time.Second)
+		delay := debrid.RateLimitDelay(err)
+		if delay <= 0 {
+			delay = 30 * time.Second
+		}
+		s.rateLimitedUntil[current.Provider] = time.Now().Add(delay)
 	} else if err == nil {
 		delete(s.rateLimitedUntil, current.Provider)
 	}

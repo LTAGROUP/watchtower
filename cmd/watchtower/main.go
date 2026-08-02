@@ -45,10 +45,11 @@ func main() {
 		os.Exit(1)
 	}
 	apiClient := &http.Client{Timeout: 30 * time.Second}
+	torboxGuard := debrid.NewTorBoxGuard(cfg.TorBoxRequestInterval, cfg.TorBoxRateLimitCooldown, cfg.TorBoxUncachedCreateInterval)
 	providerFactory := func(current config.Config) map[string]debrid.Provider {
 		providers := map[string]debrid.Provider{}
 		if current.TorBoxToken != "" {
-			providers["torbox"] = &debrid.TorBox{Token: current.TorBoxToken, Client: apiClient, AllowUncached: current.AllowUncached}
+			providers["torbox"] = &debrid.TorBox{Token: current.TorBoxToken, Client: apiClient, AllowUncached: current.AllowUncached, Guard: torboxGuard}
 		}
 		if current.AllDebridToken != "" {
 			providers["alldebrid"] = &debrid.AllDebrid{Token: current.AllDebridToken, Client: apiClient, AllowUncached: current.AllowUncached}
@@ -100,7 +101,8 @@ func main() {
 		}
 	}()
 	<-ctx.Done()
-	shutdown, _ := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdown, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelShutdown()
 	_ = server.Shutdown(shutdown)
 	_ = dashboardServer.Shutdown(shutdown)
 }

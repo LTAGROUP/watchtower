@@ -8,19 +8,21 @@ import (
 )
 
 type Config struct {
-	ListenAddr, DataFile                       string
-	DashboardAddr, DashboardUsername           string
-	DashboardPassword, SettingsFile            string
-	PublicBaseURL                              string
-	SeerrURL, SeerrAPIKey                      string
-	PlexURL, PlexToken                         string
-	TorBoxToken, AllDebridToken                string
-	Providers, Qualities, StremioAddons        []string
-	PollInterval, ResolveTimeout, StreamURLTTL time.Duration
-	PlexScanDelay                              time.Duration
-	MinSeeders                                 int
-	MaxResults                                 int
-	AllowUncached                              bool
+	ListenAddr, DataFile                           string
+	DashboardAddr, DashboardUsername               string
+	DashboardPassword, SettingsFile                string
+	PublicBaseURL                                  string
+	SeerrURL, SeerrAPIKey                          string
+	PlexURL, PlexToken                             string
+	TorBoxToken, AllDebridToken                    string
+	Providers, Qualities, StremioAddons            []string
+	PollInterval, ResolveTimeout, StreamURLTTL     time.Duration
+	PlexScanDelay                                  time.Duration
+	TorBoxRequestInterval, TorBoxRateLimitCooldown time.Duration
+	TorBoxUncachedCreateInterval                   time.Duration
+	MinSeeders                                     int
+	MaxResults                                     int
+	AllowUncached                                  bool
 }
 
 func Load() Config {
@@ -36,7 +38,9 @@ func Load() Config {
 		StremioAddons: list(env("STREMIO_ADDONS", "torrentio|https://torrentio.strem.fun/manifest.json")),
 		PollInterval:  duration("SEERR_POLL_INTERVAL", 2*time.Minute), ResolveTimeout: duration("RESOLVE_TIMEOUT", 15*time.Minute),
 		StreamURLTTL: duration("STREAM_URL_TTL", 45*time.Minute), PlexScanDelay: duration("PLEX_SCAN_DELAY", 45*time.Second), MinSeeders: integer("MIN_SEEDERS", 0),
-		MaxResults: integer("MAX_RESULTS_PER_QUALITY", 20), AllowUncached: boolean("ALLOW_UNCACHED", false),
+		TorBoxRequestInterval: duration("TORBOX_REQUEST_INTERVAL", 250*time.Millisecond), TorBoxRateLimitCooldown: duration("TORBOX_RATE_LIMIT_COOLDOWN", time.Minute),
+		TorBoxUncachedCreateInterval: duration("TORBOX_UNCACHED_CREATE_INTERVAL", time.Minute),
+		MaxResults:                   integer("MAX_RESULTS_PER_QUALITY", 20), AllowUncached: boolean("ALLOW_UNCACHED", false),
 	}
 }
 
