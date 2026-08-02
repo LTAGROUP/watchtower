@@ -20,6 +20,7 @@ type Config struct {
 	PlexScanDelay                                  time.Duration
 	TorBoxRequestInterval, TorBoxRateLimitCooldown time.Duration
 	TorBoxUncachedCreateInterval                   time.Duration
+	ResolutionConcurrency                          int
 	MinSeeders                                     int
 	MaxResults                                     int
 	AllowUncached                                  bool
@@ -40,6 +41,7 @@ func Load() Config {
 		StreamURLTTL: duration("STREAM_URL_TTL", 45*time.Minute), PlexScanDelay: duration("PLEX_SCAN_DELAY", 45*time.Second), MinSeeders: integer("MIN_SEEDERS", 0),
 		TorBoxRequestInterval: duration("TORBOX_REQUEST_INTERVAL", 250*time.Millisecond), TorBoxRateLimitCooldown: duration("TORBOX_RATE_LIMIT_COOLDOWN", time.Minute),
 		TorBoxUncachedCreateInterval: duration("TORBOX_UNCACHED_CREATE_INTERVAL", time.Minute),
+		ResolutionConcurrency:        integer("RESOLUTION_CONCURRENCY", 2),
 		MaxResults:                   integer("MAX_RESULTS_PER_QUALITY", 20), AllowUncached: boolean("ALLOW_UNCACHED", false),
 	}
 }

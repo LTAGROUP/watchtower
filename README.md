@@ -117,6 +117,7 @@ Seerr stack can reach the webhook. Use the Docker host's LAN IP in Seerr, not
 | `TORBOX_REQUEST_INTERVAL` | `250ms` | Minimum spacing between requests to the same TorBox endpoint; keeps the default below 300 requests/minute |
 | `TORBOX_RATE_LIMIT_COOLDOWN` | `1m` | Fallback cooldown when TorBox returns HTTP 429 without `Retry-After` |
 | `TORBOX_UNCACHED_CREATE_INTERVAL` | `1m` | Minimum spacing for uncached TorBox torrent creation; the guard also enforces the rolling 60/hour cap |
+| `RESOLUTION_CONCURRENCY` | `2` | Maximum number of media resolutions running concurrently across imports, retries, release jobs, and dashboard requests |
 | `LOG_COLOR` | `true` | Use colors and text styling in console logs; set to `false` for plain-text log collectors |
 | `SEERR_POLL_INTERVAL` | `2m` | Approved-request polling interval |
 | `WATCHTOWER_CORE_PORT` | `8080` | Host port for the core API, WebDAV, health check, and Seerr webhook |

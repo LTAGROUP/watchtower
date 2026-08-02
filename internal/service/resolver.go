@@ -29,17 +29,20 @@ var episodeRangeRE = regexp.MustCompile(`(?i)S(\d{1,2})E\d{1,3}[ ._-]*(?:-|to)[ 
 var videoExt = map[string]bool{".mkv": true, ".mp4": true, ".avi": true, ".m4v": true, ".ts": true, ".mov": true}
 
 type Resolver struct {
-	Config          config.Config
-	Settings        func() config.Config
-	Store           *store.Store
-	Scraper         scraper.Searcher
-	ScraperFactory  func(config.Config) (scraper.Searcher, error)
-	Providers       map[string]debrid.Provider
-	ProviderFactory func(config.Config) map[string]debrid.Provider
-	LibraryChanged  func()
-	Log             *slog.Logger
-	repairMu        sync.Mutex
-	repairs         map[string]*repairCall
+	Config                config.Config
+	Settings              func() config.Config
+	Store                 *store.Store
+	Scraper               scraper.Searcher
+	ScraperFactory        func(config.Config) (scraper.Searcher, error)
+	Providers             map[string]debrid.Provider
+	ProviderFactory       func(config.Config) map[string]debrid.Provider
+	LibraryChanged        func()
+	Log                   *slog.Logger
+	ResolutionConcurrency int
+	repairMu              sync.Mutex
+	repairs               map[string]*repairCall
+	resolutionMu          sync.Mutex
+	resolutionSlots       chan struct{}
 }
 
 type repairCall struct {
@@ -65,6 +68,15 @@ func (r *Resolver) Rerequest(ctx context.Context, m *model.Media, season, episod
 }
 
 func (r *Resolver) resolve(ctx context.Context, m *model.Media, selectedSeason, selectedEpisode int, replaceExisting bool) error {
+	release, err := r.acquireResolution(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return r.resolveUnbounded(ctx, m, selectedSeason, selectedEpisode, replaceExisting)
+}
+
+func (r *Resolver) resolveUnbounded(ctx context.Context, m *model.Media, selectedSeason, selectedEpisode int, replaceExisting bool) error {
 	if IsUnreleased(m, time.Now()) {
 		m.Status = "unreleased"
 		m.Error = ""
@@ -150,6 +162,7 @@ func (r *Resolver) resolve(ctx context.Context, m *model.Media, selectedSeason, 
 			}
 		}
 	}
+	rateLimitedProviders := map[string]bool{}
 jobLoop:
 	for _, work := range jobs {
 		q := work.quality
@@ -202,6 +215,9 @@ jobLoop:
 		found := false
 		for _, rel := range rels {
 			for _, name := range cfg.Providers {
+				if rateLimitedProviders[name] {
+					continue
+				}
 				p := providers[name]
 				if p == nil {
 					continue
@@ -214,6 +230,9 @@ jobLoop:
 				resolved, e := p.Resolve(attempt, rel)
 				cancel()
 				if e != nil {
+					if errors.Is(e, debrid.ErrRateLimited) {
+						rateLimitedProviders[name] = true
+					}
 					if r.Log != nil {
 						r.Log.Warn("provider resolution failed", "component", "resolver", "title", m.Title, "target", label, "provider", p.Name(), "source", rel.Source, "duration", time.Since(attemptStarted).String(), "error", e)
 					}
@@ -310,6 +329,24 @@ jobLoop:
 	return err
 }
 
+func (r *Resolver) acquireResolution(ctx context.Context) (func(), error) {
+	if r.ResolutionConcurrency <= 0 {
+		return func() {}, nil
+	}
+	r.resolutionMu.Lock()
+	if r.resolutionSlots == nil {
+		r.resolutionSlots = make(chan struct{}, r.ResolutionConcurrency)
+	}
+	slots := r.resolutionSlots
+	r.resolutionMu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func IsUnreleased(m *model.Media, now time.Time) bool {
 	date := validDate(m.ReleaseDate)
 	return date != "" && date > now.UTC().Format("2006-01-02")
@@ -372,7 +409,13 @@ func (r *Resolver) Repair(ctx context.Context, stale *model.File) (*model.File, 
 	r.repairs[stale.ID] = call
 	r.repairMu.Unlock()
 
-	call.file, call.err = r.repair(ctx, stale)
+	release, acquireErr := r.acquireResolution(ctx)
+	if acquireErr != nil {
+		call.err = acquireErr
+	} else {
+		call.file, call.err = r.repair(ctx, stale)
+		release()
+	}
 	close(call.done)
 	r.repairMu.Lock()
 	delete(r.repairs, stale.ID)
@@ -435,8 +478,12 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 	if stale.Provider != "" {
 		providerOrder = moveFirst(providerOrder, stale.Provider)
 	}
+	rateLimitedProviders := map[string]bool{}
 	for _, release := range releases {
 		for _, name := range providerOrder {
+			if rateLimitedProviders[name] {
+				continue
+			}
 			provider := providers[name]
 			if provider == nil {
 				continue
@@ -445,6 +492,9 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 			resolved, resolveErr := provider.Resolve(attempt, release)
 			cancel()
 			if resolveErr != nil {
+				if errors.Is(resolveErr, debrid.ErrRateLimited) {
+					rateLimitedProviders[name] = true
+				}
 				continue
 			}
 			target := *media

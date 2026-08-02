@@ -64,7 +64,7 @@ func main() {
 		return &scraper.Aggregator{Addons: addons, Client: apiClient, Log: log}, nil
 	}
 	plex := &service.Plex{Config: cfg, Settings: settings.Snapshot, Client: apiClient, Log: log}
-	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, LibraryChanged: plex.Notify, Log: log}
+	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, ResolutionConcurrency: cfg.ResolutionConcurrency, LibraryChanged: plex.Notify, Log: log}
 	streamClient := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}, Timeout: 0}
 	streamer := &service.Streamer{Store: st, Settings: settings.Snapshot, ProviderFactory: providerFactory, Repair: resolver.Repair, Client: streamClient, TTL: cfg.StreamURLTTL, Log: log}
 	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Client: apiClient, Log: log}

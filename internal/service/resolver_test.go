@@ -44,6 +44,10 @@ type recordingProvider struct {
 	results map[string]model.Resolved
 }
 
+type rateLimitedProvider struct {
+	calls int
+}
+
 type episodeSearcher struct {
 	queries []scraper.Query
 }
@@ -79,6 +83,72 @@ func (p *recordingProvider) Resolve(_ context.Context, release model.Release) (m
 }
 func (p *recordingProvider) StreamURL(context.Context, *model.File) (string, error) {
 	return "", nil
+}
+
+func (p *rateLimitedProvider) Name() string { return "test" }
+func (p *rateLimitedProvider) Resolve(context.Context, model.Release) (model.Resolved, error) {
+	p.calls++
+	return model.Resolved{}, debrid.ErrRateLimited
+}
+func (p *rateLimitedProvider) StreamURL(context.Context, *model.File) (string, error) {
+	return "", nil
+}
+
+func TestResolverLimitsConcurrentResolutions(t *testing.T) {
+	resolver := &Resolver{ResolutionConcurrency: 1}
+	release, err := resolver.acquireResolution(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan struct{})
+	go func() {
+		second, acquireErr := resolver.acquireResolution(context.Background())
+		if acquireErr == nil {
+			second()
+		}
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second resolution acquired the only slot")
+	case <-time.After(20 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("second resolution did not acquire the released slot")
+	}
+}
+
+func TestResolverSkipsRateLimitedProviderForRemainingCandidates(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 13, Type: "movie", Title: "Example", Year: 2025}
+	if err := st.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rateLimitedProvider{}
+	searcher := &recordingSearcher{releases: []model.Release{
+		{Title: "Example 1080p A", DownloadURL: "a", Seeders: 10},
+		{Title: "Example 1080p B", DownloadURL: "b", Seeders: 9},
+	}}
+	resolver := &Resolver{
+		Config:  config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:   st,
+		Scraper: searcher,
+		Providers: map[string]debrid.Provider{
+			"test": provider,
+		},
+	}
+	if err := resolver.Resolve(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("expected rate-limited provider to be attempted once, got %d calls", provider.calls)
+	}
 }
 
 func TestMaterializeMovieAndSeasonPack(t *testing.T) {
