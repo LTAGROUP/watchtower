@@ -39,6 +39,7 @@ type Media struct {
 // from executing the same durable command after it has been claimed.
 type MediaWork struct {
 	Mode       string    `json:"mode,omitempty"`
+	Quality    string    `json:"quality,omitempty"`
 	Season     int       `json:"season,omitempty"`
 	Episode    int       `json:"episode,omitempty"`
 	Generation int64     `json:"generation,omitempty"`

@@ -13,7 +13,8 @@ This project is intended for media you are authorized to access. It does not byp
 - direct WatchTower requests from the dashboard without creating a Seerr request
 - independent 2160p and 1080p release selection
 - season-pack-first TV selection with expansion into Plex-compatible episode paths
-- targeted season and single-episode re-requests that keep current files until replacements resolve
+- full-media rescrapes plus targeted quality, season, and single-episode retries that keep current files until replacements resolve
+- manual per-file scraping with an operator-selected release; candidate download details stay server-side and are revalidated before resolution
 - cached-only selection by default
 - HTTP Range and HEAD passthrough for seeking and Plex analysis
 - bounded sparse-file caching for fast Plex analysis, random seeks, and repeated playback

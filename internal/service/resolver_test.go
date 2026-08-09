@@ -214,7 +214,7 @@ func TestQueueResetAtomicallyRequeuesCurrentMediaAndUnmarksRequests(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if queued.Work != (model.MediaWork{Mode: workModeResolve, Generation: 9}) || queued.Status != "queued" || queued.Error != "" || !queued.ScrapedAt.IsZero() {
+	if queued.Work != (model.MediaWork{Mode: workModeReset, Generation: 9}) || queued.Status != "queued" || queued.Error != "" || !queued.ScrapedAt.IsZero() {
 		t.Fatalf("reset did not create fresh durable work: %#v", queued)
 	}
 	if queued.Title != media.Title || queued.Overview != media.Overview || queued.SeerrMediaID != media.SeerrMediaID || queued.PlexIntent != media.PlexIntent || queued.AvailabilityIntent != media.AvailabilityIntent {
@@ -227,6 +227,132 @@ func TestQueueResetAtomicallyRequeuesCurrentMediaAndUnmarksRequests(t *testing.T
 	}
 	if _, err := (&Resolver{Store: state}).QueueReset(999); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing reset error = %v, want not exist", err)
+	}
+}
+
+func TestResetRescrapesExistingMovieFiles(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 303, Type: "movie", TMDBID: 7003, Title: "Example", Status: "ready"}
+	if err := state.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.AddFiles(&model.File{ID: "old-1080", MediaID: media.ID, Path: "Movies/Example/Example [1080p].mkv", Quality: "1080p", SourceURI: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &recordingSearcher{releases: []model.Release{{Title: "Example.1080p.WEB-DL", DownloadURL: "new", Seeders: 50}}}
+	provider := &recordingProvider{results: map[string]model.Resolved{"new": {ItemID: "new-item", Cached: true, Files: []model.RemoteFile{{ID: "new-file", Name: "Example.mkv", Size: 200}}}}}
+	resolver := &Resolver{
+		Config: config.Config{Qualities: []string{"1080p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:  state, Scraper: searcher, Providers: map[string]debrid.Provider{"test": provider},
+	}
+	queued, err := resolver.QueueReset(media.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Work.Mode != workModeReset {
+		t.Fatalf("reset work mode = %q", queued.Work.Mode)
+	}
+	if err := resolver.RunDue(context.Background(), media.ID); err != nil {
+		t.Fatal(err)
+	}
+	files := state.FilesForMedia(media.ID)
+	if len(provider.titles) != 1 || len(files) != 1 || files[0].SourceURI != "new" {
+		t.Fatalf("reset did not rescrape and replace existing slot: calls=%#v files=%#v", provider.titles, files)
+	}
+}
+
+func TestFileRetryTargetsOnlySelectedQuality(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 304, Type: "movie", TMDBID: 7004, Title: "Example", Status: "ready"}
+	if err := state.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	old1080 := &model.File{ID: "old-1080", MediaID: media.ID, Path: "Movies/Example/Example [1080p].mkv", Quality: "1080p", SourceURI: "old-1080"}
+	old2160 := &model.File{ID: "old-2160", MediaID: media.ID, Path: "Movies/Example/Example [2160p].mkv", Quality: "2160p", SourceURI: "old-2160"}
+	if err := state.AddFiles(old1080, old2160); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &recordingSearcher{releases: []model.Release{{Title: "Example.1080p.REMUX", DownloadURL: "new-1080", Seeders: 30}}}
+	provider := &recordingProvider{results: map[string]model.Resolved{"new-1080": {ItemID: "item", Cached: true, Files: []model.RemoteFile{{ID: "remote", Name: "Example.mkv", Size: 300}}}}}
+	resolver := &Resolver{
+		Config: config.Config{Qualities: []string{"1080p", "2160p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:  state, Scraper: searcher, Providers: map[string]debrid.Provider{"test": provider},
+	}
+	queued, err := resolver.QueueFileRetry(media.ID, old1080.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Work.Mode != workModeRetryFile || queued.Work.Quality != "1080p" {
+		t.Fatalf("unexpected targeted work: %#v", queued.Work)
+	}
+	if err := resolver.RunDue(context.Background(), media.ID); err != nil {
+		t.Fatal(err)
+	}
+	files := state.FilesForMedia(media.ID)
+	if len(files) != 2 {
+		t.Fatalf("targeted retry changed file count: %#v", files)
+	}
+	byQuality := map[string]*model.File{}
+	for _, file := range files {
+		byQuality[file.Quality] = file
+	}
+	if byQuality["1080p"].SourceURI != "new-1080" || byQuality["2160p"].ID != old2160.ID {
+		t.Fatalf("targeted retry replaced the wrong slots: %#v", files)
+	}
+}
+
+func TestManualSelectionRevalidatesCandidateAndReplacesOnlyTarget(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 305, Type: "movie", TMDBID: 7005, Title: "Example", Status: "ready"}
+	if err := state.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	old1080 := &model.File{ID: "manual-old-1080", MediaID: media.ID, Path: "Movies/Example/Example [1080p].mkv", Quality: "1080p", SourceURI: "old-1080"}
+	old2160 := &model.File{ID: "manual-old-2160", MediaID: media.ID, Path: "Movies/Example/Example [2160p].mkv", Quality: "2160p", SourceURI: "old-2160"}
+	if err := state.AddFiles(old1080, old2160); err != nil {
+		t.Fatal(err)
+	}
+	release := model.Release{Title: "Example.1080p.Chosen", DownloadURL: "chosen", Source: "addon", Size: 400, Seeders: 12}
+	searcher := &recordingSearcher{releases: []model.Release{release, {Title: "Example.2160p.Other", DownloadURL: "other", Seeders: 99}}}
+	provider := &recordingProvider{results: map[string]model.Resolved{"chosen": {ItemID: "chosen-item", Cached: true, Files: []model.RemoteFile{{ID: "chosen-file", Name: "Example.mkv", Size: 400}}}}}
+	resolver := &Resolver{
+		Config: config.Config{Qualities: []string{"1080p", "2160p"}, Providers: []string{"test"}, MaxResults: 20, ResolveTimeout: time.Second},
+		Store:  state, Scraper: searcher, Providers: map[string]debrid.Provider{"test": provider},
+	}
+	target := ManualTarget{Quality: "1080p"}
+	candidates, err := resolver.ManualCandidates(context.Background(), media.ID, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].Title != release.Title {
+		t.Fatalf("unexpected manual candidates: %#v", candidates)
+	}
+	selected, err := resolver.ResolveManual(context.Background(), media.ID, target, candidates[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.SourceURI != "chosen" {
+		t.Fatalf("manual selection returned wrong source: %#v", selected)
+	}
+	files := state.FilesForMedia(media.ID)
+	if len(files) != 2 {
+		t.Fatalf("manual selection changed file count: %#v", files)
+	}
+	byQuality := map[string]*model.File{}
+	for _, file := range files {
+		byQuality[file.Quality] = file
+	}
+	if byQuality["1080p"].SourceURI != "chosen" || byQuality["2160p"].ID != old2160.ID {
+		t.Fatalf("manual selection replaced the wrong slot: %#v", files)
 	}
 }
 

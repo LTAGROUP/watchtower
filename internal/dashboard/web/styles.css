@@ -311,6 +311,16 @@ dialog::backdrop { background: rgba(4,5,8,.75); backdrop-filter: blur(5px); }
 .detail-file-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .button.compact { height: 29px; padding: 0 9px; font-size: 9px; }
 .stream-pill { padding: 5px 8px; border-radius: 20px; background: rgba(114,214,160,.08); color: var(--good); font-size: 8px; font-weight: 800; text-transform: capitalize; }
+.manual-scrape-dialog { width: min(720px, calc(100vw - 32px)); }
+.manual-scrape-dialog .dialog-card > .muted { margin-top: 9px; line-height: 1.55; }
+.manual-target-fields { display: grid; gap: 12px; margin-top: 22px; }
+.manual-tv-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.manual-results { max-height: min(420px, 48vh); overflow: auto; display: grid; gap: 8px; margin-top: 18px; padding-right: 3px; }
+.manual-candidate { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 14px; padding: 13px; border: 1px solid #2d333e; border-radius: 9px; background: #101319; }
+.manual-candidate strong, .manual-candidate small { display: block; }
+.manual-candidate strong { font-size: 10px; line-height: 1.45; }
+.manual-candidate small { margin-top: 5px; color: var(--muted); font-size: 8px; }
+.error-copy { color: var(--bad); }
 .detail-loading { min-height: 420px; display: grid; place-items: center; color: var(--muted); }
 
 @media (max-width: 1180px) {

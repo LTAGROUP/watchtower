@@ -37,6 +37,12 @@ func (s *dormantSearcher) Search(context.Context, scraper.Query, int) ([]model.R
 	return nil, errors.New("scheduler should be the only resolver launcher")
 }
 
+type recordingDashboardSearcher struct{ releases []model.Release }
+
+func (s *recordingDashboardSearcher) Search(context.Context, scraper.Query, int) ([]model.Release, error) {
+	return append([]model.Release(nil), s.releases...), nil
+}
+
 func TestLogsReturnsBufferedEntries(t *testing.T) {
 	logs := logging.NewBuffer(25)
 	slog.New(logs.Handler(slog.LevelDebug)).Warn("provider unavailable", "component", "resolver", "provider", "torbox")
@@ -458,6 +464,61 @@ func TestRerequestEpisodeEndpointQueuesTargetAndKeepsExistingFileOnFailure(t *te
 	}
 }
 
+func TestRetryFileEndpointQueuesOnlyThatResolution(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 22, Type: "movie", Title: "Example", Status: "ready"}
+	if err := state.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "retry-2160", MediaID: media.ID, Path: "Movies/Example/Example [2160p].mkv", Quality: "2160p"}
+	if err := state.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &service.Resolver{Store: state}
+	handler := (&Handler{Store: state, Resolver: resolver, Username: "admin", Password: "secret"}).Routes()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/media/22/files/retry-2160/retry", nil)
+	request.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("retry file returned %d: %s", response.Code, response.Body.String())
+	}
+	queued, _ := state.MediaByID(media.ID)
+	if queued.Work.Mode != "retry-file" || queued.Work.Quality != "2160p" || queued.Status != "queued" {
+		t.Fatalf("unexpected file retry work: %#v", queued)
+	}
+}
+
+func TestManualScrapeEndpointReturnsSafeCandidateMetadata(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &model.Media{ID: 23, Type: "movie", TMDBID: 2300, Title: "Example", Status: "ready"}
+	if err := state.UpsertMedia(media); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &service.Resolver{
+		Config: config.Config{Qualities: []string{"1080p"}, MaxResults: 20}, Store: state,
+		Scraper: &recordingDashboardSearcher{releases: []model.Release{{Title: "Example.1080p", DownloadURL: "secret-download", InfoHash: "secret-hash", Source: "addon", Size: 42, Seeders: 7}}},
+	}
+	handler := (&Handler{Store: state, Resolver: resolver, Username: "admin", Password: "secret"}).Routes()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/media/23/scrape", strings.NewReader(`{"quality":"1080p"}`))
+	request.SetBasicAuth("admin", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("manual scrape returned %d: %s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"title":"Example.1080p"`) || !strings.Contains(body, `"source":"addon"`) || strings.Contains(body, "secret-download") || strings.Contains(body, "secret-hash") {
+		t.Fatalf("manual scrape exposed wrong candidate data: %s", body)
+	}
+}
+
 func TestCreateRequestOnlyPersistsAndWakesScheduler(t *testing.T) {
 	catalog := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/movie/77" {
@@ -619,7 +680,7 @@ func TestResetEndpointQueuesCurrentFinishStateWithoutStaleOverwrite(t *testing.T
 	if got.PlexIntent != (model.DurableIntent{Generation: 7, CompletedGeneration: 6, Attempts: 2, NextAt: finishedAt.Add(time.Minute), LeaseUntil: finishedAt.Add(2 * time.Minute), LeaseGeneration: 7}) || got.AvailabilityIntent != (model.DurableIntent{Generation: 5, CompletedGeneration: 4, Attempts: 3, NextAt: finishedAt.Add(3 * time.Minute), LeaseUntil: finishedAt.Add(4 * time.Minute), LeaseGeneration: 5}) {
 		t.Fatalf("reset restored stale durable intents: %#v", got)
 	}
-	if got.Status != "queued" || got.Error != "" || !got.ScrapedAt.IsZero() || got.Work.Mode != "resolve" || got.Work.Generation != 1 || got.Work.Season != 0 || got.Work.Episode != 0 || got.Work.Attempts != 0 || !got.Work.NextAt.IsZero() || !got.Work.LeaseUntil.IsZero() {
+	if got.Status != "queued" || got.Error != "" || !got.ScrapedAt.IsZero() || got.Work.Mode != "reset" || got.Work.Generation != 1 || got.Work.Season != 0 || got.Work.Episode != 0 || got.Work.Attempts != 0 || !got.Work.NextAt.IsZero() || !got.Work.LeaseUntil.IsZero() {
 		t.Fatalf("reset did not create a fresh resolve command: %#v", got)
 	}
 	if state.IsProcessed(501) || state.IsProcessed(502) {
@@ -636,7 +697,7 @@ func TestDeleteAndLifecycleCommandsDoNotResurrectOrDeleteQueuedMedia(t *testing.
 	}{
 		{
 			name:     "reset",
-			workMode: "resolve",
+			workMode: "reset",
 			queue: func(resolver *service.Resolver, id int64) (*model.Media, error) {
 				return resolver.QueueReset(id)
 			},

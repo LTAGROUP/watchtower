@@ -250,6 +250,24 @@
       </div>
     </article>
   </dialog>
+
+  <dialog id="manual-scrape-dialog" class="manual-scrape-dialog">
+    <form class="dialog-card" id="manual-scrape-form">
+      <button class="dialog-close" type="button" data-close-manual aria-label="Close">×</button>
+      <p class="kicker">Manual resolution</p>
+      <h2 id="manual-scrape-title">Choose a stream</h2>
+      <p class="muted">Scrape this exact slot, review the available releases, then choose which one WatchTower should resolve.</p>
+      <div class="manual-target-fields">
+        <label><span>Resolution</span><select id="manual-quality" required></select></label>
+        <div id="manual-tv-fields" class="manual-tv-fields" hidden>
+          <label><span>Season</span><input id="manual-season" type="number" min="1" inputmode="numeric"></label>
+          <label><span>Episode</span><input id="manual-episode" type="number" min="1" inputmode="numeric"></label>
+        </div>
+      </div>
+      <div id="manual-results" class="manual-results" hidden></div>
+      <div class="dialog-actions"><button class="button ghost" type="button" data-close-manual>Cancel</button><button id="manual-search" class="button primary" type="submit">Find streams</button></div>
+    </form>
+  </dialog>
   <script src="/app.js" defer></script>
 </body>
 </html>

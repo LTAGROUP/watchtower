@@ -58,6 +58,9 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/media/{id}/poster", h.mediaPoster)
 	mux.HandleFunc("POST /api/v1/media/{id}/reset", h.resetMedia)
 	mux.HandleFunc("POST /api/v1/media/{id}/rerequest", h.rerequestMedia)
+	mux.HandleFunc("POST /api/v1/media/{id}/files/{fileId}/retry", h.retryFile)
+	mux.HandleFunc("POST /api/v1/media/{id}/scrape", h.manualScrape)
+	mux.HandleFunc("POST /api/v1/media/{id}/manual-resolve", h.manualResolve)
 	mux.HandleFunc("DELETE /api/v1/media/{id}", h.deleteMedia)
 	root, _ := fs.Sub(webFiles, "web")
 	files := http.FileServer(http.FS(root))
@@ -441,6 +444,104 @@ func (h *Handler) rerequestMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	h.wakeScheduler()
 	writeJSON(w, http.StatusAccepted, map[string]any{"media": queued, "season": input.Season, "episode": input.Episode})
+}
+
+func (h *Handler) retryFile(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 || strings.TrimSpace(r.PathValue("fileId")) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("invalid media or file id"))
+		return
+	}
+	if h.Resolver == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("media resolver is unavailable"))
+		return
+	}
+	queued, err := h.Resolver.QueueFileRetry(id, r.PathValue("fileId"))
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, errors.New("media item not found"))
+		return
+	}
+	if errors.Is(err, service.ErrInvalidFileRetry) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	h.wakeScheduler()
+	writeJSON(w, http.StatusAccepted, map[string]any{"media": queued, "fileId": r.PathValue("fileId")})
+}
+
+func (h *Handler) manualScrape(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("invalid media id"))
+		return
+	}
+	var target service.ManualTarget
+	if err := decodeJSON(w, r, &target); err != nil {
+		return
+	}
+	if h.Resolver == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("media resolver is unavailable"))
+		return
+	}
+	candidates, err := h.Resolver.ManualCandidates(r.Context(), id, target)
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, errors.New("media item not found"))
+		return
+	}
+	if errors.Is(err, service.ErrInvalidManualTarget) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"candidates": candidates, "target": target})
+}
+
+type manualResolveInput struct {
+	Quality     string `json:"quality"`
+	Season      int    `json:"season,omitempty"`
+	Episode     int    `json:"episode,omitempty"`
+	CandidateID string `json:"candidateId"`
+}
+
+func (h *Handler) manualResolve(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("invalid media id"))
+		return
+	}
+	var input manualResolveInput
+	if err := decodeJSON(w, r, &input); err != nil {
+		return
+	}
+	if h.Resolver == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("media resolver is unavailable"))
+		return
+	}
+	file, err := h.Resolver.ResolveManual(r.Context(), id, service.ManualTarget{Quality: input.Quality, Season: input.Season, Episode: input.Episode}, input.CandidateID)
+	if errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusNotFound, errors.New("media item not found"))
+		return
+	}
+	if errors.Is(err, service.ErrInvalidManualTarget) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if errors.Is(err, service.ErrManualCandidateNotFound) {
+		writeError(w, http.StatusConflict, errors.New("that stream is no longer available; scrape again"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"file": detailFiles([]*model.File{file})[0]})
 }
 
 func (h *Handler) deleteMedia(w http.ResponseWriter, r *http.Request) {

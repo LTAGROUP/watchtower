@@ -1,6 +1,6 @@
 const state = {
   route: 'dashboard', summary: null, media: [], files: [], queue: [], settings: null,
-  libraryTab: 'media', libraryType: 'all', libraryStatus: 'all', libraryQuality: 'all', queueType: 'all', queueStatus: 'all', detailCache: new Map(), detail: null,
+  libraryTab: 'media', libraryType: 'all', libraryStatus: 'all', libraryQuality: 'all', queueType: 'all', queueStatus: 'all', detailCache: new Map(), detail: null, manualTarget: null,
   discover: { page: 1, totalPages: 1, results: [], loading: false, hasMore: true },
   logs: { entries: [], capacity: 0, loading: false }
 };
@@ -282,7 +282,7 @@ function renderMediaDetails(data, type, id) {
   const backdrop = d.backdropPath || data.media?.backdropPath;
   if (backdrop) $('#detail-backdrop').src = `https://image.tmdb.org/t/p/w1280${backdrop}`; else $('#detail-backdrop').removeAttribute('src');
   if (data.inLibrary) {
-    $('#detail-actions').innerHTML = `<button class="button ghost" data-reset-id="${data.media.id}">Retry missing files</button><button class="button danger" data-delete-id="${data.media.id}" data-delete-title="${escapeHTML(title)}">Delete from library</button>`;
+    $('#detail-actions').innerHTML = `<button class="button ghost" data-reset-id="${data.media.id}">Rescrape media</button><button class="button ghost" data-manual-scrape>Choose stream</button><button class="button danger" data-delete-id="${data.media.id}" data-delete-title="${escapeHTML(title)}">Delete from library</button>`;
   } else {
     $('#detail-actions').innerHTML = `<button class="button primary" data-request-id="${id}" data-request-type="${type}" data-request-title="${escapeHTML(title)}" data-request-year="${escapeHTML(year)}">Request media</button>`;
   }
@@ -321,9 +321,10 @@ function renderDetailFiles() {
     const ref = episodeRef(file.path);
     const key = ref ? `${ref.season}:${ref.episode}` : '';
     const tracked = ref && (data.media?.seasons || []).map(Number).includes(ref.season);
-    const action = data.inLibrary && type === 'tv' && tracked && !episodeActions.has(key) ? `<button type="button" class="button ghost compact" data-rerequest-season="${ref.season}" data-rerequest-episode="${ref.episode}">Re-request episode</button>` : '';
-    if (action) episodeActions.add(key);
-    return `<article class="detail-file"><div><strong title="${escapeHTML(file.path)}">${escapeHTML(lastPath(file.path))}</strong><small>${escapeHTML(file.quality)} · ${escapeHTML(file.provider)} · ${formatBytes(file.size)}<br>${escapeHTML(file.path)}</small></div><div class="detail-file-actions"><span class="stream-pill">${escapeHTML(file.streamState || 'on demand')}</span>${action}</div></article>`;
+    const episodeAction = data.inLibrary && type === 'tv' && tracked && !episodeActions.has(key) ? `<button type="button" class="button ghost compact" data-rerequest-season="${ref.season}" data-rerequest-episode="${ref.episode}">Retry episode</button>` : '';
+    if (episodeAction) episodeActions.add(key);
+    const fileActions = data.inLibrary ? `<button type="button" class="button ghost compact" data-retry-file="${escapeHTML(file.id)}">Retry ${escapeHTML(file.quality)}</button><button type="button" class="button ghost compact" data-manual-scrape data-manual-file="${escapeHTML(file.id)}">Choose stream</button>` : '';
+    return `<article class="detail-file"><div><strong title="${escapeHTML(file.path)}">${escapeHTML(lastPath(file.path))}</strong><small>${escapeHTML(file.quality)} · ${escapeHTML(file.provider)} · ${formatBytes(file.size)}<br>${escapeHTML(file.path)}</small></div><div class="detail-file-actions"><span class="stream-pill">${escapeHTML(file.streamState || 'on demand')}</span>${fileActions}${episodeAction}</div></article>`;
   }).join('') : `<div class="empty-state">${escapeHTML(empty)}</div>`;
 }
 
@@ -372,10 +373,96 @@ async function resetMedia(id, button) {
   try {
     await api(`/api/v1/media/${id}/reset`, {method:'POST'});
     state.detailCache.clear();
-    showNotice('Missing-file retry started. Existing files will be kept.');
+    showNotice('Full rescrape started. Existing files will be kept until replacements are ready.');
     setTimeout(() => refreshAll(true), 700);
     $('#media-dialog').close();
   } catch (error) { showNotice(error.message, true); if (button) button.disabled = false; }
+}
+
+async function retryFile(fileId, button) {
+  const mediaId = state.detail?.data?.media?.id;
+  if (!mediaId || !fileId) return;
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/v1/media/${mediaId}/files/${encodeURIComponent(fileId)}/retry`, {method:'POST'});
+    state.detailCache.clear();
+    showNotice('That resolution was queued for a targeted rescrape. The current file will stay available.');
+    setTimeout(() => refreshAll(true), 700);
+    $('#media-dialog').close();
+  } catch (error) { showNotice(error.message, true); if (button) button.disabled = false; }
+}
+
+async function openManualScrape(fileId = '') {
+  if (!state.detail?.data?.inLibrary) return;
+  const {data, type} = state.detail;
+  const file = (data.files || []).find(item => item.id === fileId);
+  const ref = file ? episodeRef(file.path) : null;
+  if (!state.settings) {
+    try { state.settings = (await api('/api/v1/settings')).settings || {}; } catch (_) {}
+  }
+  const configured = state.settings?.qualities || [];
+  const qualities = [...new Set([file?.quality, ...configured, ...(data.files || []).map(item => item.quality), '1080p', '2160p'].filter(Boolean))];
+  $('#manual-quality').innerHTML = qualities.map(quality => `<option value="${escapeHTML(quality)}">${escapeHTML(quality)}</option>`).join('');
+  if (file?.quality) $('#manual-quality').value = file.quality;
+  const tv = type === 'tv';
+  $('#manual-tv-fields').hidden = !tv;
+  $('#manual-season').required = tv;
+  $('#manual-episode').required = tv;
+  const firstSeason = Number(state.detail.season || data.media?.seasons?.[0] || 1);
+  $('#manual-season').value = ref?.season || firstSeason;
+  $('#manual-episode').value = ref?.episode || 1;
+  $('#manual-scrape-title').textContent = `Choose a stream for ${data.media?.title || 'media'}`;
+  $('#manual-results').hidden = true;
+  $('#manual-results').innerHTML = '';
+  $('#manual-search').textContent = 'Find streams';
+  state.manualTarget = null;
+  const dialog = $('#manual-scrape-dialog');
+  dialog.dataset.mediaId = data.media.id;
+  if (!dialog.open) dialog.showModal();
+}
+
+function currentManualTarget() {
+  const target = {quality:$('#manual-quality').value};
+  if (!$('#manual-tv-fields').hidden) {
+    target.season = Number($('#manual-season').value);
+    target.episode = Number($('#manual-episode').value);
+  }
+  return target;
+}
+
+async function submitManualScrape(event) {
+  event.preventDefault();
+  const dialog = $('#manual-scrape-dialog');
+  const button = $('#manual-search');
+  const target = currentManualTarget();
+  button.disabled = true;
+  $('#manual-results').hidden = false;
+  $('#manual-results').innerHTML = '<div class="empty-state">Scraping available streams…</div>';
+  try {
+    const result = await api(`/api/v1/media/${dialog.dataset.mediaId}/scrape`, {method:'POST', body:JSON.stringify(target)});
+    state.manualTarget = target;
+    const candidates = result.candidates || [];
+    $('#manual-results').innerHTML = candidates.length ? candidates.map(candidate => `<article class="manual-candidate"><div><strong>${escapeHTML(candidate.title)}</strong><small>${escapeHTML(candidate.source || 'Unknown source')} · ${candidate.seeders < 0 ? 'seeders unknown' : `${Number(candidate.seeders).toLocaleString()} seeders`} · ${formatBytes(candidate.size)}</small></div><button type="button" class="button primary compact" data-manual-candidate="${escapeHTML(candidate.id)}">Use stream</button></article>`).join('') : '<div class="empty-state">No matching streams were found. Try another resolution or episode.</div>';
+    button.textContent = 'Search again';
+  } catch (error) {
+    $('#manual-results').innerHTML = `<div class="empty-state error-copy">${escapeHTML(error.message)}</div>`;
+  } finally { button.disabled = false; }
+}
+
+async function resolveManualCandidate(candidateId, button) {
+  const dialog = $('#manual-scrape-dialog');
+  if (!state.manualTarget || !candidateId) return;
+  button.disabled = true;
+  button.textContent = 'Resolving…';
+  try {
+    await api(`/api/v1/media/${dialog.dataset.mediaId}/manual-resolve`, {method:'POST', body:JSON.stringify({...state.manualTarget, candidateId})});
+    dialog.close();
+    state.detailCache.clear();
+    showNotice('The selected stream is now active for that file.');
+    const {type, id} = state.detail;
+    renderMediaDetails(await loadDetails(type, id, true), type, id);
+    await refreshAll(true);
+  } catch (error) { showNotice(error.message, true); button.disabled = false; button.textContent = 'Use stream'; }
 }
 
 async function rerequestMedia(season, episode, button) {
@@ -597,6 +684,7 @@ $('#queue-status').addEventListener('change', event => { state.queueStatus = eve
 $('#settings-form').addEventListener('submit', saveSettings);
 $('#settings-form').addEventListener('change', event => { if (event.target.matches('.choice-option input[type="checkbox"]')) updateChoiceOption(event.target); });
 $('#request-form').addEventListener('submit', submitRequest);
+$('#manual-scrape-form').addEventListener('submit', submitManualScrape);
 $('#select-all-seasons').addEventListener('click', event => {
   const boxes = $$('input[type="checkbox"]', $('#season-options'));
   const shouldCheck = boxes.some(box => !box.checked);
@@ -612,10 +700,17 @@ document.addEventListener('keydown', event => {
 document.addEventListener('click', event => {
   if (event.target.closest('[data-close-dialog]')) $('#request-dialog').close();
   if (event.target.closest('[data-close-media]')) $('#media-dialog').close();
+  if (event.target.closest('[data-close-manual]')) $('#manual-scrape-dialog').close();
   const request = event.target.closest('[data-request-id]');
   if (request) { event.stopPropagation(); openRequest(request); return; }
   const reset = event.target.closest('[data-reset-id]');
   if (reset) { event.stopPropagation(); resetMedia(reset.dataset.resetId, reset); return; }
+  const retryFileButton = event.target.closest('[data-retry-file]');
+  if (retryFileButton) { event.stopPropagation(); retryFile(retryFileButton.dataset.retryFile, retryFileButton); return; }
+  const manual = event.target.closest('[data-manual-scrape]');
+  if (manual) { event.stopPropagation(); openManualScrape(manual.dataset.manualFile || ''); return; }
+  const candidate = event.target.closest('[data-manual-candidate]');
+  if (candidate) { event.stopPropagation(); resolveManualCandidate(candidate.dataset.manualCandidate, candidate); return; }
   const rerequest = event.target.closest('[data-rerequest-season]');
   if (rerequest) { event.stopPropagation(); rerequestMedia(rerequest.dataset.rerequestSeason, rerequest.dataset.rerequestEpisode, rerequest); return; }
   const remove = event.target.closest('[data-delete-id]');

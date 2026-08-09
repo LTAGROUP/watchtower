@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -64,7 +65,9 @@ type repairCall struct {
 
 const (
 	workModeResolve   = "resolve"
+	workModeReset     = "reset"
 	workModeRerequest = "rerequest"
+	workModeRetryFile = "retry-file"
 )
 
 var (
@@ -72,7 +75,32 @@ var (
 	// ErrInvalidRerequestScope lets callers map a rejected scoped retry to a
 	// client error without matching an implementation-detail message.
 	ErrInvalidRerequestScope = errors.New("invalid re-request scope")
+	// ErrInvalidFileRetry lets callers distinguish an unknown or mismatched
+	// file from an internal queueing failure.
+	ErrInvalidFileRetry = errors.New("invalid file retry")
+	// ErrInvalidManualTarget identifies a malformed manual scrape target.
+	ErrInvalidManualTarget = errors.New("invalid manual scrape target")
+	// ErrManualCandidateNotFound means the selected result was not present in
+	// the server's fresh scrape and therefore was not trusted for resolution.
+	ErrManualCandidateNotFound = errors.New("manual scrape candidate not found")
 )
+
+// ManualTarget identifies one resolution slot for an operator-directed scrape.
+type ManualTarget struct {
+	Quality string `json:"quality"`
+	Season  int    `json:"season,omitempty"`
+	Episode int    `json:"episode,omitempty"`
+}
+
+// ManualCandidate is the safe dashboard representation of a scraper release.
+// Download URLs, torrent bytes, and info hashes deliberately remain server-side.
+type ManualCandidate struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Source  string `json:"source"`
+	Size    int64  `json:"size"`
+	Seeders int    `json:"seeders"`
+}
 
 func (r *Resolver) Resolve(ctx context.Context, m *model.Media) error {
 	queued, err := r.Queue(m)
@@ -128,9 +156,302 @@ func (r *Resolver) QueueReset(id int64) (*model.Media, error) {
 	now := time.Now().UTC()
 	return r.Store.UpdateMediaAtomic(id, func(current *model.Media, transaction *store.MediaTransaction) error {
 		transaction.UnmarkProcessed(mergeRequestIDs(current.RequestIDs, []int64{current.RequestID})...)
-		queueCurrentWork(current, model.MediaWork{Mode: workModeResolve}, now)
+		queueCurrentWork(current, model.MediaWork{Mode: workModeReset}, now)
 		return nil
 	})
+}
+
+// QueueFileRetry queues only the resolution slot represented by fileID. For a
+// movie that is one quality; for TV it is one quality/season/episode tuple.
+// The existing file remains readable until a replacement is successfully
+// materialized and committed.
+func (r *Resolver) QueueFileRetry(mediaID int64, fileID string) (*model.Media, error) {
+	if r.Store == nil {
+		return nil, errors.New("media store is required")
+	}
+	if mediaID <= 0 || strings.TrimSpace(fileID) == "" {
+		return nil, fmt.Errorf("%w: media and file IDs are required", ErrInvalidFileRetry)
+	}
+	now := time.Now().UTC()
+	return r.Store.UpdateMediaAtomic(mediaID, func(current *model.Media, transaction *store.MediaTransaction) error {
+		var target *model.File
+		for _, file := range transaction.FilesForMedia() {
+			if file.ID == fileID {
+				target = file
+				break
+			}
+		}
+		if target == nil || strings.TrimSpace(target.Quality) == "" {
+			return fmt.Errorf("%w: file does not belong to media or has no quality", ErrInvalidFileRetry)
+		}
+		season, episode := fileEpisode(target)
+		if current.Type == "tv" && (season <= 0 || episode <= 0) {
+			return fmt.Errorf("%w: TV file has no episode identity", ErrInvalidFileRetry)
+		}
+		queueCurrentWork(current, model.MediaWork{Mode: workModeRetryFile, Quality: target.Quality, Season: season, Episode: episode}, now)
+		return nil
+	})
+}
+
+// ManualCandidates scrapes one operator-selected slot without resolving it.
+// Results contain only display metadata and an opaque content-derived ID.
+func (r *Resolver) ManualCandidates(ctx context.Context, mediaID int64, target ManualTarget) ([]ManualCandidate, error) {
+	if r.Store == nil {
+		return nil, errors.New("media store is required")
+	}
+	target.Quality = strings.TrimSpace(target.Quality)
+	media, ok := r.Store.MediaByID(mediaID)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	cfg := r.currentConfig()
+	if err := validateManualTarget(media, target); err != nil {
+		return nil, err
+	}
+	releases, err := r.manualReleases(ctx, media, target, cfg)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	_, _ = r.Store.UpdateMedia(mediaID, func(current *model.Media) error {
+		current.ScrapedAt = now
+		current.UpdatedAt = now
+		return nil
+	})
+	out := make([]ManualCandidate, 0, len(releases))
+	for _, release := range releases {
+		out = append(out, manualCandidate(release))
+	}
+	return out, nil
+}
+
+// ResolveManual re-scrapes and validates candidateID before asking a provider
+// to resolve it. Only the selected slot is replaced, and current files remain
+// untouched if the candidate cannot be resolved.
+func (r *Resolver) ResolveManual(ctx context.Context, mediaID int64, target ManualTarget, candidateID string) (*model.File, error) {
+	if r.Store == nil {
+		return nil, errors.New("media store is required")
+	}
+	target.Quality = strings.TrimSpace(target.Quality)
+	media, ok := r.Store.MediaByID(mediaID)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if strings.TrimSpace(candidateID) == "" {
+		return nil, fmt.Errorf("%w: choose a scrape result", ErrManualCandidateNotFound)
+	}
+	releaseMedia, err := r.acquireMedia(ctx, media)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseMedia()
+	releaseSlot, err := r.acquireResolution(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
+
+	media, ok = r.Store.MediaByID(mediaID)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	cfg := r.currentConfig()
+	if err := validateManualTarget(media, target); err != nil {
+		return nil, err
+	}
+	releases, err := r.manualReleases(ctx, media, target, cfg)
+	if err != nil {
+		return nil, err
+	}
+	var selected *model.Release
+	for i := range releases {
+		if manualReleaseID(releases[i]) == candidateID {
+			selected = &releases[i]
+			break
+		}
+	}
+	if selected == nil {
+		return nil, ErrManualCandidateNotFound
+	}
+	providers := r.Providers
+	if r.ProviderFactory != nil {
+		providers = r.ProviderFactory(cfg)
+	}
+	if delay, cooling := r.allProvidersCooling(cfg.Providers, providers); cooling {
+		return nil, fmt.Errorf("all providers cooling down; retry after %s", formatProviderCooldown(delay))
+	}
+	targetSlot := resolutionSlot(media.Type, target.Quality, target.Season, target.Episode)
+	var lastErr error
+	for _, name := range cfg.Providers {
+		if r.providerCooling(name) {
+			continue
+		}
+		provider := providers[name]
+		if provider == nil {
+			continue
+		}
+		attempt, cancel := context.WithTimeout(ctx, cfg.ResolveTimeout)
+		resolved, resolveErr := provider.Resolve(attempt, *selected)
+		cancel()
+		if resolveErr != nil {
+			lastErr = resolveErr
+			if delay, cooldown := debrid.ProviderCooldown(resolveErr); cooldown {
+				r.markProviderCooldown(name, delay)
+			}
+			continue
+		}
+		materializeTarget := *media
+		if target.Season > 0 {
+			materializeTarget.Seasons = []int{target.Season}
+		}
+		var replacement *model.File
+		for _, file := range r.materialize(&materializeTarget, target.Quality, provider.Name(), *selected, resolved) {
+			if fileResolutionSlot(media.Type, file) == targetSlot {
+				replacement = file
+				break
+			}
+		}
+		if replacement == nil {
+			lastErr = errors.New("selected stream did not contain the requested file")
+			continue
+		}
+		stored, replaceErr := r.commitManualReplacement(mediaID, target, replacement, cfg.Qualities)
+		if replaceErr != nil {
+			return nil, replaceErr
+		}
+		if r.LibraryChanged != nil {
+			r.LibraryChanged()
+		}
+		if r.WorkCompleted != nil {
+			r.WorkCompleted()
+		}
+		if r.Log != nil {
+			r.Log.Info("manual stream selected", "component", "resolver", "title", media.Title, "quality", target.Quality, "season", target.Season, "episode", target.Episode, "provider", provider.Name(), "source", selected.Source)
+		}
+		return stored, nil
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("selected stream could not be resolved: %w", lastErr)
+	}
+	return nil, errors.New("no configured provider could resolve the selected stream")
+}
+
+func (r *Resolver) currentConfig() config.Config {
+	cfg := r.Config
+	if r.Settings != nil {
+		cfg = r.Settings()
+	}
+	return cfg
+}
+
+func validateManualTarget(media *model.Media, target ManualTarget) error {
+	target.Quality = strings.TrimSpace(target.Quality)
+	if media == nil || target.Quality == "" {
+		return fmt.Errorf("%w: quality is required", ErrInvalidManualTarget)
+	}
+	if media.Type == "movie" {
+		if target.Season != 0 || target.Episode != 0 {
+			return fmt.Errorf("%w: movie targets cannot include an episode", ErrInvalidManualTarget)
+		}
+		return nil
+	}
+	if media.Type != "tv" || target.Season <= 0 || target.Episode <= 0 || !containsInt(media.Seasons, target.Season) {
+		return fmt.Errorf("%w: choose a tracked TV season and episode", ErrInvalidManualTarget)
+	}
+	if count := media.EpisodeCounts[target.Season]; count > 0 && target.Episode > count {
+		return fmt.Errorf("%w: episode %d is outside season %d", ErrInvalidManualTarget, target.Episode, target.Season)
+	}
+	return nil
+}
+
+func (r *Resolver) manualReleases(ctx context.Context, media *model.Media, target ManualTarget, cfg config.Config) ([]model.Release, error) {
+	searcher := r.Scraper
+	if r.ScraperFactory != nil {
+		var err error
+		searcher, err = r.ScraperFactory(cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if searcher == nil {
+		return nil, errors.New("media scraper is unavailable")
+	}
+	limit := cfg.MaxResults
+	if media.Type == "tv" {
+		limit = 0
+	}
+	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: target.Season, Episode: target.Episode}, limit)
+	if err != nil {
+		return nil, err
+	}
+	candidates := releases[:0]
+	for _, release := range releases {
+		if (release.Seeders < 0 || release.Seeders >= cfg.MinSeeders) && matchesQuality(release.Title, target.Quality) {
+			candidates = append(candidates, release)
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return releasePreferred(candidates[i], candidates[j], target.Quality, target.Season)
+	})
+	if cfg.MaxResults > 0 && len(candidates) > cfg.MaxResults {
+		candidates = candidates[:cfg.MaxResults]
+	}
+	return candidates, nil
+}
+
+func manualCandidate(release model.Release) ManualCandidate {
+	return ManualCandidate{ID: manualReleaseID(release), Title: release.Title, Source: release.Source, Size: release.Size, Seeders: release.Seeders}
+}
+
+func manualReleaseID(release model.Release) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{release.Title, release.DownloadURL, release.InfoHash, release.Source, strconv.FormatInt(release.Size, 10)}, "\x00")))
+	return hex.EncodeToString(sum[:12])
+}
+
+func (r *Resolver) commitManualReplacement(mediaID int64, target ManualTarget, replacement *model.File, qualities []string) (*model.File, error) {
+	targetSlot := resolutionSlot("movie", target.Quality, target.Season, target.Episode)
+	var storedFile *model.File
+	_, err := r.Store.UpdateMediaAtomic(mediaID, func(current *model.Media, transaction *store.MediaTransaction) error {
+		targetSlot = resolutionSlot(current.Type, target.Quality, target.Season, target.Episode)
+		files := transaction.FilesForMedia()
+		finalFiles := make([]*model.File, 0, len(files)+1)
+		for _, file := range files {
+			if fileResolutionSlot(current.Type, file) != targetSlot {
+				finalFiles = append(finalFiles, file)
+			}
+		}
+		storedFile = replacement
+		finalFiles = append(finalFiles, replacement)
+		if err := transaction.ReplaceFiles(finalFiles...); err != nil {
+			return err
+		}
+		if current.Work.Mode == workModeRetryFile && strings.EqualFold(current.Work.Quality, target.Quality) && current.Work.Season == target.Season && current.Work.Episode == target.Episode {
+			current.Work = model.MediaWork{}
+		}
+		if current.Work.Mode == "" {
+			current.Status = ResolvedMediaStatus(current, finalFiles, qualities)
+		} else if current.Work.LeaseUntil.After(time.Now().UTC()) {
+			current.Status = "resolving"
+		} else {
+			current.Status = "queued"
+		}
+		current.Error = ""
+		current.ScrapedAt = time.Now().UTC()
+		current.UpdatedAt = time.Now().UTC()
+		current.PlexIntent.Generation++
+		if current.PlexIntent.Generation <= 0 {
+			current.PlexIntent.Generation = 1
+		}
+		current.PlexIntent.Attempts = 0
+		current.PlexIntent.NextAt = time.Now().UTC().Add(r.plexScanDelay())
+		current.PlexIntent.LeaseUntil = time.Time{}
+		current.PlexIntent.LeaseGeneration = 0
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return storedFile, nil
 }
 
 // QueueExistingRerequest atomically validates and queues a scoped retry for
@@ -273,12 +594,16 @@ func (r *Resolver) RunDue(ctx context.Context, id int64) error {
 	}
 	defer releaseSlot()
 
-	selectedSeason, selectedEpisode := 0, 0
-	replaceExisting := claimed.Work.Mode == workModeRerequest
-	if replaceExisting {
+	selectedSeason, selectedEpisode, selectedQuality := 0, 0, ""
+	replaceExisting := claimed.Work.Mode == workModeReset || claimed.Work.Mode == workModeRerequest || claimed.Work.Mode == workModeRetryFile
+	forceReplaceAll := claimed.Work.Mode == workModeReset
+	if claimed.Work.Mode == workModeRerequest || claimed.Work.Mode == workModeRetryFile {
 		selectedSeason, selectedEpisode = claimed.Work.Season, claimed.Work.Episode
 	}
-	err = r.resolveUnbounded(ctx, claimed, selectedSeason, selectedEpisode, replaceExisting)
+	if claimed.Work.Mode == workModeRetryFile {
+		selectedQuality = claimed.Work.Quality
+	}
+	err = r.resolveUnbounded(ctx, claimed, selectedQuality, selectedSeason, selectedEpisode, replaceExisting, forceReplaceAll)
 	if err != nil {
 		_ = r.releaseClaim(claimed.ID, claimed.Work, time.Now().UTC(), err)
 	}
@@ -671,7 +996,7 @@ func futureEpisodeAt(media *model.Media, season, episode int, now time.Time) tim
 	return releaseDueAt(date)
 }
 
-func (r *Resolver) resolveUnbounded(ctx context.Context, m *model.Media, selectedSeason, selectedEpisode int, replaceExisting bool) error {
+func (r *Resolver) resolveUnbounded(ctx context.Context, m *model.Media, selectedQuality string, selectedSeason, selectedEpisode int, replaceExisting, forceReplaceAll bool) error {
 	if IsUnreleased(m, time.Now()) {
 		m.Status = "unreleased"
 		m.Error = ""
@@ -725,7 +1050,11 @@ func (r *Resolver) resolveUnbounded(ctx context.Context, m *model.Media, selecte
 	}
 	var jobs []job
 	var futureAt time.Time
-	for _, q := range cfg.Qualities {
+	qualities := cfg.Qualities
+	if selectedQuality != "" {
+		qualities = []string{selectedQuality}
+	}
+	for _, q := range qualities {
 		if m.Type == "tv" && len(m.Seasons) > 0 {
 			seasons := m.Seasons
 			if selectedSeason > 0 {
@@ -758,11 +1087,11 @@ func (r *Resolver) resolveUnbounded(ctx context.Context, m *model.Media, selecte
 	for _, work := range jobs {
 		slot := resolutionSlot(m.Type, work.quality, work.season, work.episode)
 		wantedSlots[slot] = true
-		if replaceExisting && selectedEpisode > 0 {
+		if forceReplaceAll || (replaceExisting && selectedEpisode > 0) {
 			delete(completedSlots, slot)
 		}
 	}
-	if replaceExisting && selectedEpisode == 0 {
+	if replaceExisting && !forceReplaceAll && selectedEpisode == 0 {
 		for _, file := range existingFiles {
 			season, _ := fileEpisode(file)
 			if season == selectedSeason {
