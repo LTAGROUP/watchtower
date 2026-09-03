@@ -179,8 +179,12 @@ func TestStreamerRefreshesURLAfterProviderServerError(t *testing.T) {
 
 func TestStreamerForwardsRangeThroughProviderRedirect(t *testing.T) {
 	var receivedRange string
+	var receivedIfRange, receivedIfNoneMatch, receivedIfModifiedSince string
 	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedRange = r.Header.Get("Range")
+		receivedIfRange = r.Header.Get("If-Range")
+		receivedIfNoneMatch = r.Header.Get("If-None-Match")
+		receivedIfModifiedSince = r.Header.Get("If-Modified-Since")
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.Header().Set("Content-Length", "5")
@@ -207,6 +211,9 @@ func TestStreamerForwardsRangeThroughProviderRedirect(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil)
 	req.Header.Set("Range", "bytes=0-4")
+	req.Header.Set("If-Range", `"watchtower-etag"`)
+	req.Header.Set("If-None-Match", `"watchtower-etag"`)
+	req.Header.Set("If-Modified-Since", "Wed, 01 Jan 2020 00:00:00 GMT")
 	recorder := httptest.NewRecorder()
 	streamer.Serve(recorder, req, file)
 	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "video" {
@@ -214,6 +221,42 @@ func TestStreamerForwardsRangeThroughProviderRedirect(t *testing.T) {
 	}
 	if receivedRange != "bytes=0-4" {
 		t.Fatalf("range header was not forwarded through redirect: %q", receivedRange)
+	}
+	if receivedIfRange != "" || receivedIfNoneMatch != "" || receivedIfModifiedSince != "" {
+		t.Fatalf("WebDAV validators leaked to provider: if-range=%q if-none-match=%q if-modified-since=%q", receivedIfRange, receivedIfNoneMatch, receivedIfModifiedSince)
+	}
+}
+
+func TestStreamerRetriesUpstreamBadRequest(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			http.Error(w, "temporary provider bad request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer upstream.Close()
+
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rotatingProvider{url: upstream.URL}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour, RetryBackoff: time.Nanosecond}
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "video" {
+		t.Fatalf("unexpected response %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if requests != 2 || provider.calls != 2 {
+		t.Fatalf("expected one retry after upstream 400, requests=%d provider_calls=%d", requests, provider.calls)
 	}
 }
 
@@ -476,7 +519,7 @@ func TestStreamerTreatsDownstreamDisconnectAsExpectedCancellation(t *testing.T) 
 	if writer.status != http.StatusPartialContent {
 		t.Fatalf("unexpected status %d", writer.status)
 	}
-	if !strings.Contains(logs.String(), "stream transfer canceled by client") || strings.Contains(logs.String(), "stream transfer interrupted") {
+	if !strings.Contains(logs.String(), "stream transfer closed by downstream client") || strings.Contains(logs.String(), "stream transfer interrupted") {
 		t.Fatalf("unexpected disconnect logs: %s", logs.String())
 	}
 }

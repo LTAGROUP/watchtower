@@ -98,7 +98,10 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			http.Error(w, requestErr.Error(), http.StatusBadGateway)
 			return
 		}
-		for _, h := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "User-Agent"} {
+		// The WebDAV ETag and modification date belong to WatchTower's virtual
+		// file, not the provider's representation. Forwarding those validators
+		// can make a CDN ignore Range and return the entire file as 200 OK.
+		for _, h := range []string{"Range", "User-Agent"} {
 			req.Header.Set(h, r.Header.Get(h))
 		}
 		client := s.Client
@@ -119,10 +122,14 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		}
 		if retryableStatus(resp.StatusCode) {
 			resp.Body.Close()
+			willRetry := attempt+1 < maxAttempts
 			if s.Log != nil {
-				s.Log.Warn("stream link rejected by upstream", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "status", resp.StatusCode, "will_refresh", attempt+1 < maxAttempts)
+				s.Log.Warn("stream link rejected by upstream", "component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt+1, "status", resp.StatusCode, "will_refresh", willRetry)
 			}
-			if attempt+1 < maxAttempts {
+			if willRetry {
+				if !s.waitForRetry(r.Context(), attempt) {
+					return
+				}
 				continue
 			}
 			http.Error(w, fmt.Sprintf("provider stream unavailable after %d attempts", maxAttempts), http.StatusBadGateway)
@@ -145,10 +152,11 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		if s.Log != nil {
 			attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.StatusCode, "bytes", written, "attempts", attempt + 1, "duration", time.Since(started).String()}
 			if e != nil {
-				attrs = append(attrs, "error", errProviderStreamUnavailable)
 				if clientClosedConnection(r.Context(), e) {
-					s.Log.Debug("stream transfer canceled by client", attrs...)
+					attrs = append(attrs, "reason", "downstream closed connection")
+					s.Log.Debug("stream transfer closed by downstream client", attrs...)
 				} else {
+					attrs = append(attrs, "error", errProviderStreamUnavailable)
 					s.Log.Warn("stream transfer interrupted", attrs...)
 				}
 			} else {
@@ -195,8 +203,8 @@ func (s *Streamer) waitForRetry(ctx context.Context, attempt int) bool {
 }
 
 func retryableStatus(status int) bool {
-	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests ||
-		status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status >= 500
+	return status == http.StatusBadRequest || status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests ||
+		status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusGone || status >= 500
 }
 
 func retryableStreamLinkError(err error) bool {
