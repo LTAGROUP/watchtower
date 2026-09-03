@@ -40,7 +40,7 @@ services:
       - --vfs-cache-poll-interval=1m
       - --vfs-read-chunk-size=${VFS_READ_CHUNK_SIZE:-4M}
       - --vfs-read-chunk-size-limit=${VFS_READ_CHUNK_SIZE_LIMIT:-128M}
-      - --vfs-read-ahead=${VFS_READ_AHEAD:-4M}
+      - --vfs-read-ahead=${VFS_READ_AHEAD:-64M}
       - --buffer-size=${VFS_BUFFER_SIZE:-4M}
       - --vfs-refresh
       - --vfs-fast-fingerprint

@@ -133,6 +133,8 @@ Seerr stack can reach the webhook. Use the Docker host's LAN IP in Seerr, not
 | `VFS_DIR_CACHE_TIME` | `10s` | How long rclone caches directory listings before checking WebDAV again |
 | `VFS_READ_CHUNK_SIZE` | `4M` | Initial remote range-read size |
 | `VFS_READ_CHUNK_SIZE_LIMIT` | `128M` | Maximum sequential chunk size |
+| `VFS_READ_AHEAD` | `64M` | Extra disk-backed data rclone fetches ahead of playback |
+| `VFS_BUFFER_SIZE` | `4M` | Per-file in-memory read buffer |
 
 Tokens remain in `.env` and are never included in the persisted library metadata or WebDAV paths. The TorBox playback token is sent only to TorBox; the generated URL remains in memory. AllDebrid links are unlocked on demand and likewise remain in memory.
 
