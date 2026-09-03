@@ -19,27 +19,47 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 	return f(request)
 }
 
-func TestTorBoxStreamURLUsesPermanentRedirectLink(t *testing.T) {
+func TestTorBoxStreamURLResolvesPermanentRedirectLink(t *testing.T) {
 	called := false
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	var requestURL string
+	finalURL := "https://cdn.example.test/file.mkv?token=short-lived"
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		called = true
-		return nil, errors.New("unexpected request")
+		requestURL = req.URL.String()
+		return &http.Response{
+			StatusCode: http.StatusTemporaryRedirect,
+			Status:     http.StatusText(http.StatusTemporaryRedirect),
+			Header:     http.Header{"Location": []string{finalURL}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
 	})}
 	provider := &TorBox{Token: "token with spaces", Client: client}
 	got, err := provider.StreamURL(context.Background(), &model.File{ProviderItemID: "1", ProviderFileID: "2"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got != finalURL {
+		t.Fatalf("expected resolved CDN URL %q, got %q", finalURL, got)
+	}
+	if !called {
+		t.Fatal("stream URL generation did not resolve the redirect")
+	}
+	request, err := url.Parse(requestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := request.Query()
+	if query.Get("token") != provider.Token || query.Get("torrent_id") != "1" || query.Get("file_id") != "2" || query.Get("redirect") != "true" {
+		t.Fatalf("unexpected requestdl query: %s", requestURL)
+	}
+
 	parsed, err := url.Parse(got)
 	if err != nil {
 		t.Fatal(err)
 	}
-	query := parsed.Query()
-	if query.Get("token") != provider.Token || query.Get("torrent_id") != "1" || query.Get("file_id") != "2" || query.Get("redirect") != "true" {
-		t.Fatalf("unexpected permanent link: %s", got)
-	}
-	if called {
-		t.Fatal("stream URL generation made an API request")
+	if parsed.Host != "cdn.example.test" {
+		t.Fatalf("unexpected resolved URL: %s", got)
 	}
 }
 

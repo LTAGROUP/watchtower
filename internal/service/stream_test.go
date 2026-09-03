@@ -260,6 +260,143 @@ func TestStreamerRetriesUpstreamBadRequest(t *testing.T) {
 	}
 }
 
+func TestStreamerRetriesUnsatisfiableRangeAfterRefreshingURL(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Content-Range", "bytes */5")
+			http.Error(w, "temporary range failure", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Header().Set("Content-Range", "bytes 0-4/5")
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer upstream.Close()
+
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rotatingProvider{url: upstream.URL}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour, RetryBackoff: time.Nanosecond}
+	req := httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, req, file)
+	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "video" {
+		t.Fatalf("unexpected response %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if requests != 2 || provider.calls != 2 {
+		t.Fatalf("expected one refreshed range retry, requests=%d provider_calls=%d", requests, provider.calls)
+	}
+}
+
+func TestStreamerPassesThroughOutOfBoundsRangeWithoutRetry(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Range", "bytes */5")
+		http.Error(w, "range outside file", http.StatusRequestedRangeNotSatisfiable)
+	}))
+	defer upstream.Close()
+
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rotatingProvider{url: upstream.URL}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour}
+	req := httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil)
+	req.Header.Set("Range", "bytes=5-9")
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, req, file)
+	if recorder.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("expected 416, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if requests != 1 || provider.calls != 1 {
+		t.Fatalf("out-of-bounds range was retried, requests=%d provider_calls=%d", requests, provider.calls)
+	}
+}
+
+func TestStreamerRetriesMismatchedPartialResponse(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Range", "bytes 0-4/6")
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer upstream.Close()
+
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rotatingProvider{url: upstream.URL}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour, RetryBackoff: time.Nanosecond}
+	req := httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, req, file)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("expected invalid provider response to become 502, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if requests != 3 || provider.calls != 3 {
+		t.Fatalf("expected bounded retries for mismatched partial responses, requests=%d provider_calls=%d", requests, provider.calls)
+	}
+}
+
+func TestStreamerPropagatesUpstreamRateLimitAndAppliesCooldown(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer upstream.Close()
+
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rotatingProvider{url: upstream.URL}
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour}
+
+	first := httptest.NewRecorder()
+	streamer.Serve(first, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if first.Code != http.StatusTooManyRequests || first.Header().Get("Retry-After") != "60" {
+		t.Fatalf("unexpected first rate-limit response %d retry-after=%q body=%s", first.Code, first.Header().Get("Retry-After"), first.Body.String())
+	}
+	second := httptest.NewRecorder()
+	streamer.Serve(second, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected cooldown response 429, got %d: %s", second.Code, second.Body.String())
+	}
+	if requests != 1 || provider.calls != 1 {
+		t.Fatalf("rate limit was retried upstream during cooldown, requests=%d provider_calls=%d", requests, provider.calls)
+	}
+}
+
 func TestStreamerConvertsRepeatedProviderErrorsToBadGateway(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "satellite HTML", http.StatusInternalServerError)

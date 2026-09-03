@@ -58,7 +58,7 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			if errors.Is(e, debrid.ErrRateLimited) {
 				delay := debrid.RateLimitDelay(e)
 				if delay <= 0 {
-					delay = 30 * time.Second
+					delay = s.rateLimitCooldown(f.Provider)
 				}
 				w.Header().Set("Retry-After", retryAfterHeader(delay))
 				http.Error(w, streamSafeError(e).Error(), http.StatusTooManyRequests)
@@ -120,7 +120,39 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			http.Error(w, transportErr.Error(), http.StatusBadGateway)
 			return
 		}
-		if retryableStatus(resp.StatusCode) {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			delay := parseRetryAfter(resp.Header.Get("Retry-After"))
+			if delay <= 0 {
+				delay = s.rateLimitCooldown(f.Provider)
+			}
+			resp.Body.Close()
+			delay = s.blockProvider(f.Provider, delay)
+			if s.Log != nil {
+				s.Log.Warn("stream provider rate limited", "component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.StatusCode, "retry_after", delay.Round(time.Second).String())
+			}
+			w.Header().Set("Retry-After", retryAfterHeader(delay))
+			http.Error(w, errProviderStreamRateLimited.Error(), http.StatusTooManyRequests)
+			return
+		}
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			willRetry := attempt+1 < maxAttempts && shouldRetryRange(r, resp, f)
+			if willRetry {
+				contentRange := resp.Header.Get("Content-Range")
+				resp.Body.Close()
+				s.invalidateStreamURL(f.ID)
+				if s.Log != nil {
+					attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt + 1, "status", resp.StatusCode, "will_refresh", true}
+					if contentRange != "" {
+						attrs = append(attrs, "content_range", contentRange)
+					}
+					s.Log.Warn("stream range rejected by upstream", attrs...)
+				}
+				if !s.waitForRetry(r.Context(), attempt) {
+					return
+				}
+				continue
+			}
+		} else if retryableStatus(resp.StatusCode) {
 			resp.Body.Close()
 			willRetry := attempt+1 < maxAttempts
 			if s.Log != nil {
@@ -134,6 +166,33 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			}
 			http.Error(w, fmt.Sprintf("provider stream unavailable after %d attempts", maxAttempts), http.StatusBadGateway)
 			return
+		}
+		if resp.StatusCode == http.StatusPartialContent {
+			if reason := invalidPartialResponse(r, resp, f); reason != "" {
+				willRetry := attempt+1 < maxAttempts
+				contentRange := resp.Header.Get("Content-Range")
+				resp.Body.Close()
+				s.invalidateStreamURL(f.ID)
+				if s.Log != nil {
+					attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "attempt", attempt + 1, "will_refresh", willRetry, "reason", reason}
+					if contentRange != "" {
+						attrs = append(attrs, "content_range", contentRange)
+					}
+					if willRetry {
+						s.Log.Warn("stream partial response rejected", attrs...)
+					} else {
+						s.Log.Error("stream partial response invalid", attrs...)
+					}
+				}
+				if willRetry {
+					if !s.waitForRetry(r.Context(), attempt) {
+						return
+					}
+					continue
+				}
+				http.Error(w, errProviderStreamUnavailable.Error(), http.StatusBadGateway)
+				return
+			}
 		}
 		defer resp.Body.Close()
 		for k, vs := range resp.Header {
@@ -151,6 +210,9 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		}
 		if s.Log != nil {
 			attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.StatusCode, "bytes", written, "attempts", attempt + 1, "duration", time.Since(started).String()}
+			if contentRange := resp.Header.Get("Content-Range"); contentRange != "" {
+				attrs = append(attrs, "content_range", contentRange)
+			}
 			if e != nil {
 				if clientClosedConnection(r.Context(), e) {
 					attrs = append(attrs, "reason", "downstream closed connection")
@@ -159,6 +221,8 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 					attrs = append(attrs, "error", errProviderStreamUnavailable)
 					s.Log.Warn("stream transfer interrupted", attrs...)
 				}
+			} else if resp.StatusCode >= http.StatusBadRequest {
+				s.Log.Warn("stream request returned upstream error", attrs...)
 			} else {
 				s.Log.Info("stream request completed", attrs...)
 			}
@@ -187,6 +251,53 @@ func clientClosedConnection(ctx context.Context, err error) bool {
 	return strings.Contains(message, "write tcp") && (strings.Contains(message, "connection reset by peer") || strings.Contains(message, "broken pipe"))
 }
 
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(at); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func (s *Streamer) rateLimitCooldown(provider string) time.Duration {
+	if s.Settings != nil {
+		cfg := s.Settings()
+		switch strings.ToLower(strings.TrimSpace(provider)) {
+		case "torbox":
+			if cfg.TorBoxRateLimitCooldown > 0 {
+				return cfg.TorBoxRateLimitCooldown
+			}
+		case "alldebrid":
+			if cfg.AllDebridProviderCooldown > 0 {
+				return cfg.AllDebridProviderCooldown
+			}
+		}
+	}
+	return 30 * time.Second
+}
+
+func (s *Streamer) blockProvider(provider string, delay time.Duration) time.Duration {
+	if delay <= 0 {
+		delay = s.rateLimitCooldown(provider)
+	}
+	until := time.Now().Add(delay)
+	s.mu.Lock()
+	if s.rateLimitedUntil == nil {
+		s.rateLimitedUntil = map[string]time.Time{}
+	}
+	if current := s.rateLimitedUntil[provider]; current.After(until) {
+		until = current
+	}
+	s.rateLimitedUntil[provider] = until
+	s.mu.Unlock()
+	return time.Until(until)
+}
+
 func (s *Streamer) waitForRetry(ctx context.Context, attempt int) bool {
 	d := s.RetryBackoff
 	if d <= 0 {
@@ -203,7 +314,7 @@ func (s *Streamer) waitForRetry(ctx context.Context, attempt int) bool {
 }
 
 func retryableStatus(status int) bool {
-	return status == http.StatusBadRequest || status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests ||
+	return status == http.StatusBadRequest || status == http.StatusRequestTimeout || status == http.StatusTooEarly ||
 		status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusGone || status >= 500
 }
 
@@ -234,6 +345,109 @@ func validProviderStreamURL(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+type parsedContentRange struct {
+	start       int64
+	end         int64
+	total       int64
+	totalKnown  bool
+	unsatisfied bool
+}
+
+func parseContentRange(raw string) (parsedContentRange, bool) {
+	unit, value, ok := strings.Cut(strings.TrimSpace(raw), " ")
+	if !ok || !strings.EqualFold(unit, "bytes") {
+		return parsedContentRange{}, false
+	}
+	rangeValue, totalValue, ok := strings.Cut(strings.TrimSpace(value), "/")
+	if !ok {
+		return parsedContentRange{}, false
+	}
+	result := parsedContentRange{start: -1, end: -1}
+	totalValue = strings.TrimSpace(totalValue)
+	if totalValue != "*" {
+		total, err := strconv.ParseInt(totalValue, 10, 64)
+		if err != nil || total < 0 {
+			return parsedContentRange{}, false
+		}
+		result.total = total
+		result.totalKnown = true
+	}
+	rangeValue = strings.TrimSpace(rangeValue)
+	if rangeValue == "*" {
+		result.unsatisfied = true
+		return result, true
+	}
+	startValue, endValue, ok := strings.Cut(rangeValue, "-")
+	if !ok {
+		return parsedContentRange{}, false
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(startValue), 10, 64)
+	if err != nil || start < 0 {
+		return parsedContentRange{}, false
+	}
+	end, err := strconv.ParseInt(strings.TrimSpace(endValue), 10, 64)
+	if err != nil || end < start {
+		return parsedContentRange{}, false
+	}
+	result.start, result.end = start, end
+	return result, true
+}
+
+func requestedRangeStart(raw string) (int64, bool) {
+	unit, value, ok := strings.Cut(strings.TrimSpace(raw), "=")
+	if !ok || !strings.EqualFold(unit, "bytes") || strings.Contains(value, ",") {
+		return 0, false
+	}
+	startValue, _, ok := strings.Cut(strings.TrimSpace(value), "-")
+	if !ok || strings.TrimSpace(startValue) == "" {
+		return 0, false
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(startValue), 10, 64)
+	if err != nil || start < 0 {
+		return 0, false
+	}
+	return start, true
+}
+
+func shouldRetryRange(r *http.Request, resp *http.Response, f *model.File) bool {
+	start, ok := requestedRangeStart(r.Header.Get("Range"))
+	if !ok {
+		return false
+	}
+	if f.Size > 0 && start >= f.Size {
+		return false
+	}
+	if contentRange, ok := parseContentRange(resp.Header.Get("Content-Range")); ok && contentRange.unsatisfied && contentRange.totalKnown {
+		if (f.Size <= 0 || contentRange.total == f.Size) && start >= contentRange.total {
+			return false
+		}
+	}
+	return true
+}
+
+func invalidPartialResponse(r *http.Request, resp *http.Response, f *model.File) string {
+	contentRange, ok := parseContentRange(resp.Header.Get("Content-Range"))
+	if !ok || contentRange.unsatisfied {
+		return ""
+	}
+	if requestedStart, ok := requestedRangeStart(r.Header.Get("Range")); ok && contentRange.start != requestedStart {
+		return "content range start does not match requested range"
+	}
+	if contentRange.totalKnown && f.Size > 0 && contentRange.total != f.Size {
+		return fmt.Sprintf("content range total %d differs from file size %d", contentRange.total, f.Size)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != contentRange.end-contentRange.start+1 {
+		return "content length does not match content range"
+	}
+	return ""
+}
+
+func (s *Streamer) invalidateStreamURL(id string) {
+	if s.Store != nil {
+		s.Store.SetStream(id, "", time.Time{})
+	}
+}
+
 func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, error) {
 	s.mu.Lock()
 	current, attached := s.Store.File(f.ID)
@@ -244,6 +458,10 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 			s.Log.Warn("stream file replaced during active request; continuing with original source", "component", "stream", "file", f.Path, "provider", f.Provider)
 		}
 	}
+	if until := s.rateLimitedUntil[current.Provider]; time.Now().Before(until) {
+		s.mu.Unlock()
+		return "", debrid.NewRateLimitError(current.Provider, time.Until(until), "cooldown active")
+	}
 	if !force && current.StreamURL != "" && time.Now().Before(current.StreamExpiresAt) {
 		if u, err := validProviderStreamURL(current.StreamURL); err == nil {
 			expiresAt := current.StreamExpiresAt
@@ -253,10 +471,6 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 			}
 			return u, nil
 		}
-	}
-	if until := s.rateLimitedUntil[current.Provider]; time.Now().Before(until) {
-		s.mu.Unlock()
-		return "", debrid.NewRateLimitError(current.Provider, time.Until(until), "cooldown active")
 	}
 	if s.refreshes == nil {
 		s.refreshes = map[string]*streamRefresh{}
@@ -283,7 +497,7 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 	if errors.Is(err, debrid.ErrRateLimited) {
 		delay := debrid.RateLimitDelay(err)
 		if delay <= 0 {
-			delay = 30 * time.Second
+			delay = s.rateLimitCooldown(current.Provider)
 		}
 		s.rateLimitedUntil[current.Provider] = time.Now().Add(delay)
 	} else if err == nil {
