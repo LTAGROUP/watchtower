@@ -17,6 +17,7 @@ This project is intended for media you are authorized to access. It does not byp
 - manual per-file scraping with an operator-selected release; candidate download details stay server-side and are revalidated before resolution
 - cached-only selection by default
 - HTTP Range and HEAD passthrough for seeking and Plex analysis
+- permanent TorBox redirect links to avoid expiring CDN playback URLs
 - bounded sparse-file caching for fast Plex analysis, random seeks, and repeated playback
 - automatic URL regeneration plus in-place repair and provider fallback when a stored debrid item disappears
 - persistent JSON metadata with atomic updates; no media payload storage
@@ -114,7 +115,7 @@ Seerr stack can reach the webhook. Use the Docker host's LAN IP in Seerr, not
 | `MIN_SEEDERS` | `0` | Optional minimum seed count; cached results do not require active peers |
 | `MAX_RESULTS_PER_QUALITY` | `20` | Search attempts per edition |
 | `RESOLVE_TIMEOUT` | `15m` | Maximum provider wait per candidate |
-| `STREAM_URL_TTL` | `45m` | Proactive URL refresh interval |
+| `STREAM_URL_TTL` | `45m` | Local cache lifetime for provider stream URLs; TorBox uses permanent redirect links |
 | `TORBOX_REQUEST_INTERVAL` | `250ms` | Minimum spacing between requests to the same TorBox endpoint; keeps the default below 300 requests/minute |
 | `TORBOX_RATE_LIMIT_COOLDOWN` | `1m` | Fallback cooldown when TorBox returns HTTP 429 without `Retry-After` |
 | `TORBOX_UNCACHED_CREATE_INTERVAL` | `1m` | Minimum spacing for uncached TorBox torrent creation; the guard also enforces the rolling 60/hour cap |

@@ -158,64 +158,20 @@ func (t *TorBox) wait(ctx context.Context, id int64) (model.Resolved, error) {
 		}
 	}
 }
-func (t *TorBox) StreamURL(ctx context.Context, f *model.File) (string, error) {
-	if err := t.waitRequest(ctx, "requestdl", false); err != nil {
-		return "", err
+func (t *TorBox) StreamURL(_ context.Context, f *model.File) (string, error) {
+	if strings.TrimSpace(f.ProviderItemID) == "" || strings.TrimSpace(f.ProviderFileID) == "" {
+		return "", fmt.Errorf("torbox stream link requires torrent and file IDs")
 	}
-	u := "https://api.torbox.app/v1/api/torrents/requestdl?token=" + url.QueryEscape(t.Token) + "&torrent_id=" + url.QueryEscape(f.ProviderItemID) + "&file_id=" + url.QueryEscape(f.ProviderFileID) + "&redirect=false"
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	resp, e := t.Client.Do(req)
-	if e != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		return "", fmt.Errorf("%w: torbox request download: %v", ErrTransient, e)
-	}
-	defer resp.Body.Close()
-	body, e := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if e != nil {
-		return "", e
-	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", t.rateLimited("requestdl", resp, string(body))
-	}
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-		return "", fmt.Errorf("%w: torbox download item returned %s", ErrStaleItem, resp.Status)
-	}
-	if transientHTTPStatus(resp.StatusCode) {
-		return "", fmt.Errorf("%w: torbox request download returned %s: %s", ErrTransient, resp.Status, strings.TrimSpace(string(body)))
-	}
-	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("torbox request download: %s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	var raw map[string]any
-	if e = json.Unmarshal(body, &raw); e != nil {
-		return "", e
-	}
-	d := raw["data"]
-	if s := str(d); s != "" {
-		return s, nil
-	}
-	m := object(d)
-	for _, k := range []string{"download_link", "link", "url"} {
-		if s := str(m[k]); s != "" {
-			return s, nil
-		}
-	}
-	detail := torboxMessage(raw)
-	if detail == "" {
-		return "", fmt.Errorf("%w: download item returned no URL", ErrStaleItem)
-	}
-	if staleTorboxMessage(detail) {
-		return "", fmt.Errorf("%w: %s", ErrStaleItem, detail)
-	}
-	if strings.Contains(strings.ToLower(detail), "rate limit") {
-		return "", t.rateLimited("requestdl", resp, detail)
-	}
-	if transientTorboxMessage(detail) {
-		return "", fmt.Errorf("%w: %s", ErrTransient, detail)
-	}
-	return "", fmt.Errorf("torbox returned no stream URL: %s", detail)
+	// TorBox's redirect=true request URL is permanent. Returning it directly
+	// avoids generating a short-lived CDN URL for every Plex probe, seek, and
+	// playback retry. The Streamer follows the redirect while forwarding the
+	// caller's Range headers to the resulting file host.
+	values := url.Values{}
+	values.Set("token", t.Token)
+	values.Set("torrent_id", f.ProviderItemID)
+	values.Set("file_id", f.ProviderFileID)
+	values.Set("redirect", "true")
+	return "https://api.torbox.app/v1/api/torrents/requestdl?" + values.Encode(), nil
 }
 
 func (t *TorBox) waitRequest(ctx context.Context, endpoint string, uncachedCreate bool) error {
@@ -231,37 +187,4 @@ func (t *TorBox) rateLimited(endpoint string, resp *http.Response, detail string
 		t.Guard.Block(endpoint, delay)
 	}
 	return NewRateLimitError("torbox "+endpoint, delay, strings.TrimSpace(detail))
-}
-
-func transientHTTPStatus(status int) bool {
-	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= 500
-}
-
-func torboxMessage(raw map[string]any) string {
-	for _, key := range []string{"detail", "error", "message"} {
-		if value := strings.TrimSpace(fmt.Sprint(raw[key])); value != "" && value != "<nil>" {
-			return value
-		}
-	}
-	return ""
-}
-
-func staleTorboxMessage(message string) bool {
-	message = strings.ToLower(message)
-	for _, fragment := range []string{"not found", "does not exist", "no longer", "invalid torrent", "invalid file"} {
-		if strings.Contains(message, fragment) {
-			return true
-		}
-	}
-	return false
-}
-
-func transientTorboxMessage(message string) bool {
-	message = strings.ToLower(message)
-	for _, fragment := range []string{"bad gateway", "gateway timeout", "service unavailable", "internal server error", "temporarily unavailable", "try again", "timed out", "timeout", "rate limit"} {
-		if strings.Contains(message, fragment) {
-			return true
-		}
-	}
-	return false
 }

@@ -177,6 +177,46 @@ func TestStreamerRefreshesURLAfterProviderServerError(t *testing.T) {
 	}
 }
 
+func TestStreamerForwardsRangeThroughProviderRedirect(t *testing.T) {
+	var receivedRange string
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedRange = r.Header.Get("Range")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", "bytes 0-4/5")
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("video"))
+	}))
+	defer cdn.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cdn.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test", Size: 5}
+	if err = st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	streamer := &Streamer{
+		Store: st, Providers: map[string]debrid.Provider{"test": &rotatingProvider{url: redirect.URL}},
+		Client: redirect.Client(), TTL: time.Hour,
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	recorder := httptest.NewRecorder()
+	streamer.Serve(recorder, req, file)
+	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "video" {
+		t.Fatalf("unexpected response %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if receivedRange != "bytes=0-4" {
+		t.Fatalf("range header was not forwarded through redirect: %q", receivedRange)
+	}
+}
+
 func TestStreamerConvertsRepeatedProviderErrorsToBadGateway(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "satellite HTML", http.StatusInternalServerError)
