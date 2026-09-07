@@ -278,7 +278,7 @@ function renderMediaDetails(data, type, id) {
   $('#detail-meta').textContent = [year, ...genres].filter(Boolean).join(' · ');
   $('#detail-overview').textContent = d.overview || data.media?.overview || 'No description is available for this title.';
   const poster = d.posterPath || data.media?.posterPath;
-  $('#detail-poster').innerHTML = poster ? `<img src="https://image.tmdb.org/t/p/w500${poster}" alt="">` : `<div class="poster-fallback">${escapeHTML(title)}</div>`;
+  $('#detail-poster').innerHTML = poster && /^\/[A-Za-z0-9._-]+$/.test(poster) ? `<img src="https://image.tmdb.org/t/p/w500${poster}" alt="">` : `<div class="poster-fallback">${escapeHTML(title)}</div>`;
   const backdrop = d.backdropPath || data.media?.backdropPath;
   if (backdrop) $('#detail-backdrop').src = `https://image.tmdb.org/t/p/w1280${backdrop}`; else $('#detail-backdrop').removeAttribute('src');
   if (data.inLibrary) {

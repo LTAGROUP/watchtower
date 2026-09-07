@@ -98,8 +98,19 @@ func (t *TorBox) cached(ctx context.Context, hash string) (bool, error) {
 	if resp.StatusCode/100 != 2 {
 		return false, fmt.Errorf("torbox cache check: %s", resp.Status)
 	}
-	s := strings.ToLower(string(b))
-	return strings.Contains(s, strings.ToLower(hash)) && !strings.Contains(s, "\"data\":{}"), nil
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return false, err
+	}
+	if success, _ := raw["success"].(bool); !success {
+		return false, fmt.Errorf("torbox cache check failed: %s", torboxMessage(b))
+	}
+	for key, value := range object(raw["data"]) {
+		if strings.EqualFold(key, strings.TrimSpace(hash)) && len(object(value)) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 func (t *TorBox) wait(ctx context.Context, id int64) (model.Resolved, error) {
 	p := t.Poll
@@ -128,10 +139,14 @@ func (t *TorBox) wait(ctx context.Context, id int64) (model.Resolved, error) {
 				resp.Body.Close()
 				return model.Resolved{}, t.rateLimited("mylist", resp, string(body))
 			}
+			if resp.StatusCode/100 != 2 {
+				resp.Body.Close()
+				continue
+			}
 			var raw map[string]any
 			e = json.NewDecoder(resp.Body).Decode(&raw)
 			resp.Body.Close()
-			if e != nil {
+			if e != nil || raw["success"] != true {
 				continue
 			}
 			data := raw["data"]
@@ -147,7 +162,11 @@ func (t *TorBox) wait(ctx context.Context, id int64) (model.Resolved, error) {
 				return model.Resolved{}, fmt.Errorf("torbox torrent failed")
 			}
 			files := array(m["files"])
-			if len(files) > 0 {
+			// Torrent metadata includes file names while bytes are still being
+			// downloaded. Only publish files once the provider can serve them.
+			present, _ := m["download_present"].(bool)
+			finished, _ := m["download_finished"].(bool)
+			if len(files) > 0 && present && finished {
 				out := model.Resolved{ItemID: strconv.FormatInt(id, 10), Cached: true}
 				for _, v := range files {
 					f := object(v)

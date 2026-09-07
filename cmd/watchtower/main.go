@@ -69,7 +69,7 @@ func main() {
 	plex := &service.Plex{Config: cfg, Settings: settings.Snapshot, Store: st, Client: apiClient, Log: log}
 	resolver := &service.Resolver{Config: cfg, Settings: settings.Snapshot, Store: st, ScraperFactory: scraperFactory, ProviderFactory: providerFactory, ResolutionConcurrency: cfg.ResolutionConcurrency, LibraryChanged: plex.Notify, Log: log}
 	lifecycle := &service.Lifecycle{Store: st, Resolver: resolver, Log: log}
-	streamClient := &http.Client{Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}, Timeout: 0}
+	streamClient := newStreamClient()
 	streamer := &service.Streamer{Store: st, Settings: settings.Snapshot, ProviderFactory: providerFactory, Repair: resolver.Repair, Client: streamClient, TTL: cfg.StreamURLTTL, Log: log}
 	seerr := &service.Seerr{Config: cfg, Settings: settings.Snapshot, Store: st, Resolver: resolver, Scheduler: lifecycle, Client: apiClient, Log: log}
 	resolver.WorkCompleted = func() {
@@ -127,6 +127,16 @@ func main() {
 	case <-shutdown.Done():
 		log.Warn("service shutdown timed out", "error", shutdown.Err())
 	}
+}
+
+func newStreamClient() *http.Client {
+	// Bound connection setup and header waits without limiting the duration
+	// of a movie. The default transport supplies dial and TLS timeouts.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 20
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	return &http.Client{Transport: transport}
 }
 
 // readinessHandler is intentionally non-probing. /healthz is the Compose

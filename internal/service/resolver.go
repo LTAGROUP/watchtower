@@ -376,10 +376,8 @@ func (r *Resolver) manualReleases(ctx context.Context, media *model.Media, targe
 	if searcher == nil {
 		return nil, errors.New("media scraper is unavailable")
 	}
-	limit := cfg.MaxResults
-	if media.Type == "tv" {
-		limit = 0
-	}
+	// Apply the per-quality limit only after filtering and ranking.
+	limit := 0
 	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: target.Season, Episode: target.Episode}, limit)
 	if err != nil {
 		return nil, err
@@ -1114,12 +1112,8 @@ jobLoop:
 		}
 		m.Status = "scraping"
 		r.updateProgress(m, "scraping", time.Time{})
-		searchLimit := cfg.MaxResults
-		if m.Type == "tv" {
-			// Fetch all TV candidates so a lower-seeded season pack is not
-			// discarded before pack-aware ranking is applied below.
-			searchLimit = 0
-		}
+		// Fetch all qualities before applying the per-quality attempt limit.
+		searchLimit := 0
 		rels, err := searcher.Search(ctx, scraper.Query{MediaType: m.Type, ExternalID: m.ExternalID, TMDBID: m.TMDBID, Season: work.season, Episode: work.episode}, searchLimit)
 		if err != nil {
 			if r.Log != nil {
@@ -1484,14 +1478,6 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 	if r.Settings != nil {
 		cfg = r.Settings()
 	}
-	searcher := r.Scraper
-	if r.ScraperFactory != nil {
-		var err error
-		searcher, err = r.ScraperFactory(cfg)
-		if err != nil {
-			return nil, err
-		}
-	}
 	providers := r.Providers
 	if r.ProviderFactory != nil {
 		providers = r.ProviderFactory(cfg)
@@ -1508,17 +1494,35 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 	if r.Log != nil {
 		r.Log.Warn("stale stream repair started", "component", "resolver", "title", media.Title, "file", stale.Path, "quality", stale.Quality, "provider", stale.Provider)
 	}
-	searchLimit := cfg.MaxResults
-	if media.Type == "tv" {
-		searchLimit = 0
+	if stale.InfoHash == "" {
+		return nil, errors.New("automatic repair requires the original info hash; rescrape this file")
 	}
-	releases, err := searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: season, Episode: episode}, searchLimit)
-	if err != nil {
-		return nil, err
+	var releases []model.Release
+	if stale.SourceURI != "" {
+		// Re-add the known torrent first. Playback must not depend on an
+		// addon still listing the original release (or being online).
+		releases = []model.Release{{InfoHash: stale.InfoHash, DownloadURL: stale.SourceURI}}
+	} else {
+		searcher := r.Scraper
+		if r.ScraperFactory != nil {
+			var err error
+			searcher, err = r.ScraperFactory(cfg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if searcher == nil {
+			return nil, errors.New("media scraper is unavailable")
+		}
+		var err error
+		releases, err = searcher.Search(ctx, scraper.Query{MediaType: media.Type, ExternalID: media.ExternalID, TMDBID: media.TMDBID, Season: season, Episode: episode}, 0)
+		if err != nil {
+			return nil, err
+		}
 	}
 	candidates := releases[:0]
 	for _, release := range releases {
-		if (release.Seeders < 0 || release.Seeders >= cfg.MinSeeders) && matchesQuality(release.Title, stale.Quality) {
+		if stale.InfoHash != "" && strings.EqualFold(release.InfoHash, stale.InfoHash) {
 			candidates = append(candidates, release)
 		}
 	}
@@ -1558,7 +1562,9 @@ func (r *Resolver) repair(ctx context.Context, stale *model.File) (*model.File, 
 				target.Seasons = []int{season}
 			}
 			for _, replacement := range r.materialize(&target, stale.Quality, provider.Name(), release, resolved) {
-				if !sameMediaFile(media.Type, stale.Path, replacement.Path) {
+				// An open rclone file can already contain cached byte ranges.
+				// Repair must preserve the torrent and size, not just the title.
+				if !sameMediaFile(media.Type, stale.Path, replacement.Path) || replacement.Size != stale.Size {
 					continue
 				}
 				updated, replaceErr := r.Store.ReplaceFileSource(stale.ID, replacement)
@@ -1742,7 +1748,7 @@ func (r *Resolver) materialize(m *model.Media, q, provider string, rel model.Rel
 			base := plexFolderName(m)
 			path = fmt.Sprintf("Movies/%s/%s [%s]%s", base, base, safe(q), ext)
 		} else {
-			match := episodeRE.FindStringSubmatch(rf.Name)
+			match := remoteEpisodeMatch(rf.Name)
 			if len(match) != 3 {
 				continue
 			}
@@ -1758,6 +1764,18 @@ func (r *Resolver) materialize(m *model.Media, q, provider string, rel model.Rel
 		out = append(out, &model.File{ID: hex.EncodeToString(sum[:12]), MediaID: m.ID, Path: path, Quality: q, Provider: provider, SourceURI: rel.DownloadURL, InfoHash: rel.InfoHash, ProviderItemID: res.ItemID, ProviderFileID: rf.ID, Size: rf.Size, CreatedAt: time.Now().UTC()})
 	}
 	return out
+}
+
+func remoteEpisodeMatch(name string) []string {
+	// A pack directory can itself contain S01E01-E10. Prefer the actual
+	// file's episode marker, then the nearest enclosing directory.
+	parts := strings.Split(strings.ReplaceAll(name, "\\", "/"), "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		if match := episodeRE.FindStringSubmatch(parts[i]); len(match) == 3 {
+			return match
+		}
+	}
+	return nil
 }
 
 func plexTitle(m *model.Media) string {

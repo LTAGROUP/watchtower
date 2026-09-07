@@ -563,6 +563,17 @@ func (s *Store) SetStream(id, url string, expiresAt time.Time) {
 	}
 }
 
+// SetStreamForSource prevents a link generated before a source replacement
+// from being cached against the new source under the same virtual file ID.
+func (s *Store) SetStreamForSource(source *model.File, url string, expiresAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if file := s.state.Files[source.ID]; sameDurableFile(file, source) {
+		file.StreamURL = url
+		file.StreamExpiresAt = expiresAt
+	}
+}
+
 func (s *Store) Files() []*model.File {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

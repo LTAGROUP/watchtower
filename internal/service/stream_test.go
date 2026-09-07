@@ -138,6 +138,7 @@ func TestStreamerRefreshesURLAfterProviderServerError(t *testing.T) {
 			http.Error(w, "temporary CDN failure", http.StatusInternalServerError)
 			return
 		}
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("video"))
 	}))
@@ -235,6 +236,7 @@ func TestStreamerRetriesUpstreamBadRequest(t *testing.T) {
 			http.Error(w, "temporary provider bad request", http.StatusBadRequest)
 			return
 		}
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("video"))
 	}))
@@ -508,6 +510,7 @@ func TestStreamerSanitizesTransportErrors(t *testing.T) {
 
 func TestStreamerRetriesTransientLinkGenerationFailures(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("video"))
 	}))
@@ -617,6 +620,7 @@ func TestStreamerContinuesWhenFileIsReplacedDuringRetry(t *testing.T) {
 			http.Error(w, "temporary CDN failure", http.StatusInternalServerError)
 			return
 		}
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("video"))
 	}))
@@ -635,6 +639,7 @@ func TestStreamerContinuesWhenFileIsReplacedDuringRetry(t *testing.T) {
 
 func TestStreamerTreatsDownstreamDisconnectAsExpectedCancellation(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("video"))
 	}))
@@ -652,7 +657,14 @@ func TestStreamerTreatsDownstreamDisconnectAsExpectedCancellation(t *testing.T) 
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, Client: upstream.Client(), TTL: time.Hour, Log: logger}
 	writer := &disconnectWriter{}
-	streamer.Serve(writer, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	func() {
+		defer func() {
+			if got := recover(); got != http.ErrAbortHandler {
+				t.Errorf("expected aborted response, got %v", got)
+			}
+		}()
+		streamer.Serve(writer, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	}()
 	if writer.status != http.StatusPartialContent {
 		t.Fatalf("unexpected status %d", writer.status)
 	}
@@ -663,6 +675,7 @@ func TestStreamerTreatsDownstreamDisconnectAsExpectedCancellation(t *testing.T) 
 
 func TestStreamerRepairsStaleProviderItemBeforeServing(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-4/5")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write([]byte("video"))
 	}))

@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -61,7 +62,13 @@ func (a *AllDebrid) Resolve(ctx context.Context, r model.Release) (model.Resolve
 		return model.Resolved{}, fmt.Errorf("alldebrid returned no magnet")
 	}
 	m := object(mags[0])
+	if detail := object(m["error"]); len(detail) > 0 {
+		return model.Resolved{}, allDebridAPIError(detail)
+	}
 	id := num(m["id"])
+	if id <= 0 {
+		return model.Resolved{}, fmt.Errorf("alldebrid returned no magnet id")
+	}
 	ready, _ := m["ready"].(bool)
 	if !ready && !a.AllowUncached {
 		return model.Resolved{}, fmt.Errorf("not cached")
@@ -96,16 +103,28 @@ func (a *AllDebrid) wait(ctx context.Context, id int64) (model.Resolved, error) 
 				}
 			}
 			status := strings.ToLower(str(m["status"]))
-			if strings.Contains(status, "error") || strings.Contains(status, "fail") {
+			if num(m["statusCode"]) >= 5 || strings.Contains(status, "error") || strings.Contains(status, "fail") {
 				return model.Resolved{}, fmt.Errorf("alldebrid magnet failed: %s", status)
 			}
 			if status == "ready" || num(m["statusCode"]) == 4 {
-				fr, e := a.form(ctx, http.MethodPost, "https://api.alldebrid.com/v4/magnet/files", url.Values{"id": {strconv.FormatInt(id, 10)}})
+				fr, e := a.form(ctx, http.MethodPost, "https://api.alldebrid.com/v4/magnet/files", url.Values{"id[]": {strconv.FormatInt(id, 10)}})
 				if e != nil {
 					return model.Resolved{}, e
 				}
 				out := model.Resolved{ItemID: strconv.FormatInt(id, 10), Cached: true}
-				walkAD(array(object(fr["data"])["files"]), &out.Files)
+				for _, value := range array(object(fr["data"])["magnets"]) {
+					magnet := object(value)
+					if str(magnet["id"]) != out.ItemID && num(magnet["id"]) != id {
+						continue
+					}
+					if detail := object(magnet["error"]); len(detail) > 0 {
+						return model.Resolved{}, allDebridAPIError(detail)
+					}
+					walkAD(array(magnet["files"]), &out.Files)
+				}
+				if len(out.Files) == 0 {
+					walkAD(array(object(fr["data"])["files"]), &out.Files)
+				}
 				if len(out.Files) == 0 {
 					walkAD(array(object(fr["data"])[strconv.FormatInt(id, 10)]), &out.Files)
 				}
@@ -115,12 +134,17 @@ func (a *AllDebrid) wait(ctx context.Context, id int64) (model.Resolved, error) 
 	}
 }
 func walkAD(nodes []any, out *[]model.RemoteFile) {
+	walkADPath(nodes, "", out)
+}
+
+func walkADPath(nodes []any, parent string, out *[]model.RemoteFile) {
 	for _, v := range nodes {
 		m := object(v)
+		name := path.Join(parent, str(m["n"]))
 		if kids := array(m["e"]); len(kids) > 0 {
-			walkAD(kids, out)
+			walkADPath(kids, name, out)
 		} else if l := str(m["l"]); l != "" {
-			*out = append(*out, model.RemoteFile{ID: l, Name: str(m["n"]), Size: num(m["s"])})
+			*out = append(*out, model.RemoteFile{ID: l, Name: name, Size: num(m["s"])})
 		}
 	}
 }

@@ -149,6 +149,8 @@ browser after saving. Environment values are used as the initial defaults.
 - The rclone sidecar uses `--allow-non-empty` because `/media` is already a Docker bind-mount target before FUSE is layered over it. This does not permit writes; the remote and mount remain read-only.
 - Plex must be able to read the mounted directory, and the host bind mount must use shared propagation. A Docker named volume cannot reliably propagate a nested FUSE mount to an unrelated Plex container.
 - The rclone cache stores sparse, temporary chunks rather than complete permanent media copies. Plex probes and seeks are served from this cache when possible. Size and retention are bounded by `VFS_CACHE_MAX_SIZE` and `VFS_CACHE_MAX_AGE`.
+- Keep modification-time checks enabled on the mount. WatchTower exposes each file's publication time so rclone can invalidate cached chunks after a same-size replacement.
+- Automatic playback repair restores the original torrent and file size, including through another provider. Switching encodes requires a dashboard rescrape or manual stream selection; it cannot safely reuse byte ranges from an open cached file.
 - State is intentionally simple for this MVP. A database migration should precede multi-replica deployments.
 - Provider API shapes occasionally change. Adapter failures are isolated, and the configured provider order provides failover, but live credential tests are still required before production use.
 

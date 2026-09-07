@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -37,6 +38,7 @@ type Streamer struct {
 type streamRefresh struct {
 	done chan struct{}
 	url  string
+	file *model.File
 	err  error
 }
 
@@ -53,7 +55,8 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		s.Log.Info("stream request started", "component", "stream", "file", f.Path, "provider", f.Provider, "method", r.Method, "range", r.Header.Get("Range"))
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		u, e := s.url(r.Context(), f, attempt > 0)
+		u, source, e := s.urlWithFile(r.Context(), f, attempt > 0)
+		f = source
 		if e != nil {
 			if errors.Is(e, debrid.ErrRateLimited) {
 				delay := debrid.RateLimitDelay(e)
@@ -104,6 +107,9 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		for _, h := range []string{"Range", "User-Agent"} {
 			req.Header.Set(h, r.Header.Get(h))
 		}
+		// Byte ranges refer to the original media representation. Do not let
+		// the transport negotiate gzip and transparently change those bytes.
+		req.Header.Set("Accept-Encoding", "identity")
 		client := s.Client
 		if client == nil {
 			client = http.DefaultClient
@@ -203,10 +209,31 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 				w.Header().Add(k, v)
 			}
 		}
+		// Keep GET/HEAD validators consistent with the WebDAV listing. CDN
+		// validators may change every time a signed URL is regenerated.
+		w.Header().Set("ETag", fmt.Sprintf(`"%s-%d"`, f.ID, f.Size))
+		modified := f.CreatedAt
+		if modified.IsZero() {
+			modified = time.Unix(0, 0)
+		}
+		w.Header().Set("Last-Modified", modified.UTC().Format(http.TimeFormat))
 		w.WriteHeader(resp.StatusCode)
 		var written int64
 		if r.Method != http.MethodHead {
 			written, e = io.Copy(w, resp.Body)
+			if e == nil {
+				expected := resp.ContentLength
+				if resp.StatusCode == http.StatusPartialContent {
+					if bounds, ok := parseContentRange(resp.Header.Get("Content-Range")); ok {
+						expected = bounds.end - bounds.start + 1
+					}
+				} else if resp.StatusCode == http.StatusOK && f.Size > 0 {
+					expected = f.Size
+				}
+				if expected >= 0 && written != expected {
+					e = io.ErrUnexpectedEOF
+				}
+			}
 		}
 		if s.Log != nil {
 			attrs := []any{"component", "stream", "file", f.Path, "provider", f.Provider, "status", resp.StatusCode, "bytes", written, "attempts", attempt + 1, "duration", time.Since(started).String()}
@@ -226,6 +253,11 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 			} else {
 				s.Log.Info("stream request completed", attrs...)
 			}
+		}
+		if e != nil {
+			// Headers have already been sent. Returning normally would mark a
+			// chunked response complete and let rclone cache a truncated read.
+			panic(http.ErrAbortHandler)
 		}
 		return
 	}
@@ -426,15 +458,47 @@ func shouldRetryRange(r *http.Request, resp *http.Response, f *model.File) bool 
 }
 
 func invalidPartialResponse(r *http.Request, resp *http.Response, f *model.File) string {
+	// A multi-range response carries Content-Range in each MIME part instead
+	// of the top-level headers. Preserve that valid passthrough behavior.
+	if strings.Contains(r.Header.Get("Range"), ",") {
+		kind, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if err == nil && kind == "multipart/byteranges" && params["boundary"] != "" {
+			return ""
+		}
+	}
 	contentRange, ok := parseContentRange(resp.Header.Get("Content-Range"))
 	if !ok || contentRange.unsatisfied {
-		return ""
+		return "missing or invalid content range"
+	}
+	if contentRange.totalKnown && contentRange.end >= contentRange.total {
+		return "content range extends beyond file size"
+	}
+	if f.Size > 0 && contentRange.end >= f.Size {
+		return "content range extends beyond virtual file size"
 	}
 	if requestedStart, ok := requestedRangeStart(r.Header.Get("Range")); ok && contentRange.start != requestedStart {
 		return "content range start does not match requested range"
 	}
 	if contentRange.totalKnown && f.Size > 0 && contentRange.total != f.Size {
 		return fmt.Sprintf("content range total %d differs from file size %d", contentRange.total, f.Size)
+	}
+	if unit, value, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Range")), "="); ok && strings.EqualFold(unit, "bytes") && !strings.Contains(value, ",") {
+		start, end, ok := strings.Cut(strings.TrimSpace(value), "-")
+		if ok && end != "" {
+			if n, err := strconv.ParseInt(end, 10, 64); err == nil && n >= 0 {
+				if start == "" && n > 0 && contentRange.totalKnown {
+					wanted := contentRange.total - n
+					if wanted < 0 {
+						wanted = 0
+					}
+					if contentRange.start != wanted {
+						return "content range does not match requested suffix"
+					}
+				} else if start != "" && contentRange.end > n {
+					return "content range exceeds requested end"
+				}
+			}
+		}
 	}
 	if resp.ContentLength >= 0 && resp.ContentLength != contentRange.end-contentRange.start+1 {
 		return "content length does not match content range"
@@ -449,6 +513,11 @@ func (s *Streamer) invalidateStreamURL(id string) {
 }
 
 func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, error) {
+	u, _, err := s.urlWithFile(ctx, f, force)
+	return u, err
+}
+
+func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (string, *model.File, error) {
 	s.mu.Lock()
 	current, attached := s.Store.File(f.ID)
 	if !attached {
@@ -460,7 +529,7 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 	}
 	if until := s.rateLimitedUntil[current.Provider]; time.Now().Before(until) {
 		s.mu.Unlock()
-		return "", debrid.NewRateLimitError(current.Provider, time.Until(until), "cooldown active")
+		return "", current, debrid.NewRateLimitError(current.Provider, time.Until(until), "cooldown active")
 	}
 	if !force && current.StreamURL != "" && time.Now().Before(current.StreamExpiresAt) {
 		if u, err := validProviderStreamURL(current.StreamURL); err == nil {
@@ -469,7 +538,7 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 			if s.Log != nil {
 				s.Log.Debug("using cached stream link", "component", "stream", "file", current.Path, "provider", current.Provider, "expires_in", time.Until(expiresAt).Round(time.Second).String())
 			}
-			return u, nil
+			return u, current, nil
 		}
 	}
 	if s.refreshes == nil {
@@ -482,9 +551,14 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		s.mu.Unlock()
 		select {
 		case <-refresh.done:
-			return refresh.url, refresh.err
+			// A Plex probe can cancel while another request is waiting for its
+			// refresh. That cancellation must not fail the surviving request.
+			if ctx.Err() == nil && (errors.Is(refresh.err, context.Canceled) || errors.Is(refresh.err, context.DeadlineExceeded)) {
+				return s.urlWithFile(ctx, f, force)
+			}
+			return refresh.url, refresh.file, refresh.err
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", current, ctx.Err()
 		}
 	}
 	refresh := &streamRefresh{done: make(chan struct{})}
@@ -499,14 +573,18 @@ func (s *Streamer) url(ctx context.Context, f *model.File, force bool) (string, 
 		if delay <= 0 {
 			delay = s.rateLimitCooldown(current.Provider)
 		}
-		s.rateLimitedUntil[current.Provider] = time.Now().Add(delay)
-	} else if err == nil {
-		delete(s.rateLimitedUntil, current.Provider)
+		until := time.Now().Add(delay)
+		if until.After(s.rateLimitedUntil[current.Provider]) {
+			s.rateLimitedUntil[current.Provider] = until
+		}
 	}
+	// A successful refresh must not erase a cooldown established by another
+	// in-flight stream request while this refresh was running.
 	refresh.url, refresh.err = u, err
+	refresh.file = current
 	close(refresh.done)
 	s.mu.Unlock()
-	return u, err
+	return u, current, err
 }
 
 func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached, force bool) (string, error) {
@@ -543,7 +621,7 @@ func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached
 		if repairErr != nil {
 			return "", fmt.Errorf("automatic stream repair failed: %w", repairErr)
 		}
-		current = repaired
+		*current = *repaired
 		if s.Settings != nil {
 			cfg := s.Settings()
 			ttl = cfg.StreamURLTTL
@@ -571,7 +649,7 @@ func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached
 		return "", e
 	}
 	expires := time.Now().Add(ttl)
-	s.Store.SetStream(current.ID, u, expires)
+	s.Store.SetStreamForSource(current, u, expires)
 	if s.Log != nil {
 		s.Log.Info("stream link obtained", "component", "stream", "file", current.Path, "provider", current.Provider, "valid_for", ttl.String())
 	}

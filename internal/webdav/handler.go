@@ -53,11 +53,9 @@ type entry struct {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("DAV", "1")
 	w.Header().Set("MS-Author-Via", "DAV")
-	p, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, h.Prefix))
-	if err != nil {
-		http.Error(w, "bad path", 400)
-		return
-	}
+	// net/http has already decoded URL.Path. A second unescape corrupts
+	// literal percent signs and names containing sequences such as %20.
+	p := strings.TrimPrefix(r.URL.Path, h.Prefix)
 	p = strings.Trim(path.Clean("/"+p), "/")
 	switch r.Method {
 	case http.MethodOptions:
@@ -125,6 +123,9 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, p string) {
 			prop.ResourceType.Collection = &struct{}{}
 		} else {
 			prop.Length = e.File.Size
+			if !e.File.CreatedAt.IsZero() {
+				prop.Modified = e.File.CreatedAt.UTC().Format(http.TimeFormat)
+			}
 			prop.ContentType = "application/octet-stream"
 			prop.ETag = fmt.Sprintf(`"%s-%d"`, e.File.ID, e.File.Size)
 		}
@@ -136,7 +137,11 @@ func (h *Handler) propfind(w http.ResponseWriter, r *http.Request, p string) {
 	_ = xml.NewEncoder(w).Encode(ms)
 }
 func (h *Handler) entries() map[string]entry {
-	out := map[string]entry{"": {Path: "", Dir: true}}
+	out := map[string]entry{
+		"":       {Path: "", Dir: true},
+		"Movies": {Path: "Movies", Dir: true},
+		"TV":     {Path: "TV", Dir: true},
+	}
 	for _, f := range h.Store.Files() {
 		p := strings.Trim(f.Path, "/")
 		out[p] = entry{Path: p, File: f}
