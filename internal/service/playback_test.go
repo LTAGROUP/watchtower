@@ -414,3 +414,33 @@ func TestFailedLinkBackoffIsPerSourceAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRepairRateLimitDoesNotBlockOtherLinkGeneration(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := &model.File{ID: "broken", Provider: "test", ProviderItemID: "stale"}
+	other := &model.File{ID: "other", Provider: "test", ProviderItemID: "fresh"}
+	if err := st.AddFiles(broken, other); err != nil {
+		t.Fatal(err)
+	}
+	p := &healingProvider{url: "https://cdn.example/video"}
+	repairs := 0
+	s := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": p}, TTL: time.Hour,
+		Repair: func(context.Context, *model.File) (*model.File, error) {
+			repairs++
+			return nil, debrid.NewRateLimitError("torbox mylist", 10*time.Minute, "rate limit exceeded")
+		}}
+	if _, err := s.url(context.Background(), broken, false); !errors.Is(err, debrid.ErrRateLimited) {
+		t.Fatalf("repair: %v", err)
+	}
+	if _, err := s.url(context.Background(), other, false); err != nil {
+		t.Fatalf("unrelated link blocked: %v", err)
+	}
+	w := httptest.NewRecorder()
+	s.Serve(w, httptest.NewRequest("GET", "http://watchtower/file", nil), broken)
+	if w.Code != 503 || repairs != 1 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("repair backoff: status=%d repairs=%d", w.Code, repairs)
+	}
+}

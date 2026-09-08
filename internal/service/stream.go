@@ -552,6 +552,7 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 		}
 	}
 	if until := s.rateLimitedUntil[current.Provider]; time.Now().Before(until) {
+		s.logCooldown(current, "video_download", until)
 		s.mu.Unlock()
 		return "", current, debrid.NewRateLimitError(current.Provider, time.Until(until), "cooldown active")
 	}
@@ -567,6 +568,7 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 	}
 	// API limits only block generating new links, never an existing valid URL.
 	if until := s.linkRateLimitedUntil[current.Provider]; time.Now().Before(until) {
+		s.logCooldown(current, "link_generation", until)
 		s.mu.Unlock()
 		return "", current, debrid.NewRateLimitError(current.Provider, time.Until(until), "link API cooldown active")
 	}
@@ -574,6 +576,7 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 		if failure.source != streamSource(current) {
 			delete(s.linkFailures, current.ID)
 		} else if failure.count >= 3 && time.Now().Before(failure.until) {
+			s.logCooldown(current, "file_link_backoff", failure.until)
 			s.mu.Unlock()
 			return "", current, &streamLinkBackoff{delay: time.Until(failure.until)}
 		}
@@ -611,12 +614,20 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 		if delay <= 0 {
 			delay = s.rateLimitCooldown(current.Provider)
 		}
-		if s.linkRateLimitedUntil == nil {
-			s.linkRateLimitedUntil = map[string]time.Time{}
-		}
 		until := time.Now().Add(delay)
-		if until.After(s.linkRateLimitedUntil[current.Provider]) {
-			s.linkRateLimitedUntil[current.Provider] = until
+		if repairEndpointRateLimit(err) {
+			// Torrent listing/creation limits during repair do not limit requestdl.
+			if s.linkFailures == nil {
+				s.linkFailures = map[string]streamLinkFailure{}
+			}
+			s.linkFailures[current.ID] = streamLinkFailure{source: streamSource(current), count: 3, until: until}
+		} else {
+			if s.linkRateLimitedUntil == nil {
+				s.linkRateLimitedUntil = map[string]time.Time{}
+			}
+			if until.After(s.linkRateLimitedUntil[current.Provider]) {
+				s.linkRateLimitedUntil[current.Provider] = until
+			}
 		}
 	} else if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		if s.linkFailures == nil {
@@ -645,6 +656,29 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 	close(refresh.done)
 	s.mu.Unlock()
 	return u, current, err
+}
+
+// Only known non-playback endpoints may bypass the shared link cooldown.
+func repairEndpointRateLimit(err error) bool {
+	var limited *debrid.RateLimitError
+	if !errors.As(err, &limited) {
+		return false
+	}
+	switch limited.Endpoint {
+	case "torbox mylist", "torbox createtorrent", "torbox checkcached":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Streamer) logCooldown(f *model.File, scope string, until time.Time) {
+	if s.Log != nil {
+		s.Log.Info("stream request deferred", "component", "stream", "file", f.Path,
+			"provider", f.Provider, "cooldown_scope", scope,
+			"retry_after", retryAfterHeader(time.Until(until)), "cached_link", f.StreamURL != "",
+			"link_unexpired", time.Now().Before(f.StreamExpiresAt))
+	}
 }
 
 func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached, force bool) (string, error) {
@@ -704,7 +738,11 @@ func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached
 				if limited.Detail == "cooldown active" || limited.Detail == "link API cooldown active" {
 					origin = "local_cooldown"
 				}
-				attrs = append(attrs, "rate_limit_source", origin, "cooldown_scope", "link_generation", "retry_after", debrid.RateLimitDelay(e).Round(time.Second).String())
+				scope := "link_generation"
+				if repairEndpointRateLimit(e) {
+					scope = "source_repair"
+				}
+				attrs = append(attrs, "rate_limit_source", origin, "cooldown_scope", scope, "retry_after", debrid.RateLimitDelay(e).Round(time.Second).String())
 			}
 			s.Log.Warn("stream link refresh failed", attrs...)
 		}
