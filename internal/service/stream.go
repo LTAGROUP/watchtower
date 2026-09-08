@@ -21,18 +21,36 @@ import (
 )
 
 type Streamer struct {
-	Store            *store.Store
-	Providers        map[string]debrid.Provider
-	ProviderFactory  func(config.Config) map[string]debrid.Provider
-	Settings         func() config.Config
-	Repair           func(context.Context, *model.File) (*model.File, error)
-	Client           *http.Client
-	TTL              time.Duration
-	RetryBackoff     time.Duration
-	Log              *slog.Logger
-	mu               sync.Mutex
-	refreshes        map[string]*streamRefresh
-	rateLimitedUntil map[string]time.Time
+	Store                *store.Store
+	Providers            map[string]debrid.Provider
+	ProviderFactory      func(config.Config) map[string]debrid.Provider
+	Settings             func() config.Config
+	Repair               func(context.Context, *model.File) (*model.File, error)
+	Client               *http.Client
+	TTL                  time.Duration
+	RetryBackoff         time.Duration
+	Log                  *slog.Logger
+	mu                   sync.Mutex
+	refreshes            map[string]*streamRefresh
+	rateLimitedUntil     map[string]time.Time // Video download cooldowns.
+	linkRateLimitedUntil map[string]time.Time
+	linkFailures         map[string]streamLinkFailure
+}
+
+// Failures are scoped to a durable source, so replacing a file bypasses backoff.
+type streamLinkFailure struct {
+	source model.File
+	count  int
+	until  time.Time
+}
+type streamLinkBackoff struct{ delay time.Duration }
+
+func (e *streamLinkBackoff) Error() string { return "stream link temporarily unavailable; retry later" }
+func streamSource(f *model.File) model.File {
+	source := *f
+	source.StreamURL = ""
+	source.StreamExpiresAt = time.Time{}
+	return source
 }
 
 type streamRefresh struct {
@@ -58,6 +76,12 @@ func (s *Streamer) Serve(w http.ResponseWriter, r *http.Request, f *model.File) 
 		u, source, e := s.urlWithFile(r.Context(), f, attempt > 0)
 		f = source
 		if e != nil {
+			var backoff *streamLinkBackoff
+			if errors.As(e, &backoff) {
+				w.Header().Set("Retry-After", retryAfterHeader(backoff.delay))
+				http.Error(w, backoff.Error(), http.StatusServiceUnavailable)
+				return
+			}
 			if errors.Is(e, debrid.ErrRateLimited) {
 				delay := debrid.RateLimitDelay(e)
 				if delay <= 0 {
@@ -541,6 +565,19 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 			return u, current, nil
 		}
 	}
+	// API limits only block generating new links, never an existing valid URL.
+	if until := s.linkRateLimitedUntil[current.Provider]; time.Now().Before(until) {
+		s.mu.Unlock()
+		return "", current, debrid.NewRateLimitError(current.Provider, time.Until(until), "link API cooldown active")
+	}
+	if failure, ok := s.linkFailures[current.ID]; ok {
+		if failure.source != streamSource(current) {
+			delete(s.linkFailures, current.ID)
+		} else if failure.count >= 3 && time.Now().Before(failure.until) {
+			s.mu.Unlock()
+			return "", current, &streamLinkBackoff{delay: time.Until(failure.until)}
+		}
+	}
 	if s.refreshes == nil {
 		s.refreshes = map[string]*streamRefresh{}
 	}
@@ -565,21 +602,44 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 	s.refreshes[current.ID] = refresh
 	s.mu.Unlock()
 
+	refreshID := current.ID
 	u, err := s.refreshURL(ctx, current, attached, force)
 	s.mu.Lock()
-	delete(s.refreshes, current.ID)
+	delete(s.refreshes, refreshID)
 	if errors.Is(err, debrid.ErrRateLimited) {
 		delay := debrid.RateLimitDelay(err)
 		if delay <= 0 {
 			delay = s.rateLimitCooldown(current.Provider)
 		}
-		until := time.Now().Add(delay)
-		if until.After(s.rateLimitedUntil[current.Provider]) {
-			s.rateLimitedUntil[current.Provider] = until
+		if s.linkRateLimitedUntil == nil {
+			s.linkRateLimitedUntil = map[string]time.Time{}
 		}
+		until := time.Now().Add(delay)
+		if until.After(s.linkRateLimitedUntil[current.Provider]) {
+			s.linkRateLimitedUntil[current.Provider] = until
+		}
+	} else if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		if s.linkFailures == nil {
+			s.linkFailures = map[string]streamLinkFailure{}
+		}
+		// Prune old entries so removed library files cannot accumulate forever.
+		for id, failure := range s.linkFailures {
+			if !failure.until.After(time.Now()) {
+				delete(s.linkFailures, id)
+			}
+		}
+		failure := s.linkFailures[current.ID]
+		source := streamSource(current)
+		if failure.source != source {
+			failure = streamLinkFailure{source: source}
+		}
+		failure.count++
+		failure.until = time.Now().Add(30 * time.Second)
+		s.linkFailures[current.ID] = failure
+	} else if err == nil {
+		delete(s.linkFailures, current.ID)
 	}
-	// A successful refresh must not erase a cooldown established by another
-	// in-flight stream request while this refresh was running.
+	// Neither successful refreshes nor API failures erase download cooldowns.
 	refresh.url, refresh.err = u, err
 	refresh.file = current
 	close(refresh.done)
@@ -637,7 +697,16 @@ func (s *Streamer) refreshURL(ctx context.Context, current *model.File, attached
 	}
 	if e != nil {
 		if s.Log != nil {
-			s.Log.Warn("stream link refresh failed", "component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason, "error", streamSafeError(e))
+			attrs := []any{"component", "stream", "file", current.Path, "provider", current.Provider, "reason", reason, "error", streamSafeError(e)}
+			var limited *debrid.RateLimitError
+			if errors.As(e, &limited) {
+				origin := "provider_response"
+				if limited.Detail == "cooldown active" || limited.Detail == "link API cooldown active" {
+					origin = "local_cooldown"
+				}
+				attrs = append(attrs, "rate_limit_source", origin, "cooldown_scope", "link_generation", "retry_after", debrid.RateLimitDelay(e).Round(time.Second).String())
+			}
+			s.Log.Warn("stream link refresh failed", attrs...)
 		}
 		return "", e
 	}

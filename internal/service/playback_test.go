@@ -322,3 +322,95 @@ func TestMultipartRangeResponseRemainsSupported(t *testing.T) {
 		t.Fatalf("valid multipart rejected: %s", reason)
 	}
 }
+
+func TestLinkAPICooldownPreservesCachedPlayback(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := &model.File{ID: "active", Provider: "test", Size: 5, StreamURL: "https://cdn.example/video", StreamExpiresAt: time.Now().Add(time.Hour)}
+	missing := &model.File{ID: "missing", Provider: "test"}
+	if err := st.AddFiles(active, missing); err != nil {
+		t.Fatal(err)
+	}
+	p := &rateLimitedLinkProvider{}
+	downloads := 0
+	s := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": p}, TTL: time.Hour,
+		Client: &http.Client{Transport: streamRoundTripper(func(*http.Request) (*http.Response, error) {
+			downloads++
+			return &http.Response{StatusCode: 200, Header: make(http.Header), ContentLength: 5, Body: io.NopCloser(strings.NewReader("video"))}, nil
+		})}}
+	request := func(f *model.File) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		s.Serve(w, httptest.NewRequest("GET", "http://watchtower/file", nil), f)
+		return w
+	}
+	if w := request(missing); w.Code != 429 {
+		t.Fatalf("missing link: %d", w.Code)
+	}
+	if w := request(active); w.Code != 200 || w.Body.String() != "video" {
+		t.Fatalf("cached playback: %d %s", w.Code, w.Body.String())
+	}
+	if w := request(missing); w.Code != 429 {
+		t.Fatalf("API cooldown: %d", w.Code)
+	}
+	if p.calls != 1 || downloads != 1 {
+		t.Fatalf("calls: API=%d downloads=%d", p.calls, downloads)
+	}
+	s.mu.Lock()
+	s.linkRateLimitedUntil["test"] = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	request(missing)
+	if p.calls != 2 {
+		t.Fatalf("API did not recover after cooldown: %d", p.calls)
+	}
+}
+
+func TestFailedLinkBackoffIsPerSourceAndRecovers(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &model.File{ID: "failed", Provider: "test"}
+	other := &model.File{ID: "other", Provider: "test"}
+	if err := st.AddFiles(f, other); err != nil {
+		t.Fatal(err)
+	}
+	p := &transientLinkProvider{failures: 3, url: "https://cdn.example/video"}
+	s := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": p}, TTL: time.Hour, RetryBackoff: time.Nanosecond}
+	w := httptest.NewRecorder()
+	s.Serve(w, httptest.NewRequest("GET", "http://watchtower/file", nil), f)
+	if w.Code != 502 || p.calls != 3 {
+		t.Fatalf("initial retries: status=%d calls=%d", w.Code, p.calls)
+	}
+	w = httptest.NewRecorder()
+	s.Serve(w, httptest.NewRequest("GET", "http://watchtower/file", nil), f)
+	if w.Code != 503 || w.Header().Get("Retry-After") == "" || p.calls != 3 {
+		t.Fatalf("backoff: status=%d calls=%d", w.Code, p.calls)
+	}
+	if _, err := s.url(context.Background(), other, false); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	failure := s.linkFailures[f.ID]
+	failure.until = time.Now().Add(-time.Second)
+	s.linkFailures[f.ID] = failure
+	s.mu.Unlock()
+	if _, err := s.url(context.Background(), f, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.linkFailures) != 0 {
+		t.Fatal("successful refresh retained failures")
+	}
+
+	// A durable replacement must not inherit the previous source's failure.
+	s.linkFailures[f.ID] = streamLinkFailure{source: streamSource(f), count: 3, until: time.Now().Add(time.Minute)}
+	replacement := *f
+	replacement.ProviderItemID = "replacement"
+	if _, err := st.ReplaceFileSource(f.ID, &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.url(context.Background(), f, false); err != nil {
+		t.Fatal(err)
+	}
+}
