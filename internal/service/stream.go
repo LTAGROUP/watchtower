@@ -615,8 +615,10 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 			delay = s.rateLimitCooldown(current.Provider)
 		}
 		until := time.Now().Add(delay)
+		scope := "link_generation"
 		if repairEndpointRateLimit(err) {
 			// Torrent listing/creation limits during repair do not limit requestdl.
+			scope = "file_link_backoff"
 			if s.linkFailures == nil {
 				s.linkFailures = map[string]streamLinkFailure{}
 			}
@@ -628,6 +630,12 @@ func (s *Streamer) urlWithFile(ctx context.Context, f *model.File, force bool) (
 			if until.After(s.linkRateLimitedUntil[current.Provider]) {
 				s.linkRateLimitedUntil[current.Provider] = until
 			}
+		}
+		// Record the first rejection too, not just subsequent requests that
+		// encounter the cooldown. Provider error details can contain signed URLs.
+		if s.Log != nil {
+			s.Log.Warn("stream link request rate limited", "component", "stream", "file", current.Path,
+				"provider", current.Provider, "cooldown_scope", scope, "retry_after", retryAfterHeader(delay))
 		}
 	} else if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		if s.linkFailures == nil {

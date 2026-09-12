@@ -45,6 +45,7 @@ type blockingLinkProvider struct {
 
 type rateLimitedLinkProvider struct {
 	calls int
+	err   error
 }
 
 type streamRoundTripper func(*http.Request) (*http.Response, error)
@@ -127,6 +128,9 @@ func (p *rateLimitedLinkProvider) Resolve(context.Context, model.Release) (model
 }
 func (p *rateLimitedLinkProvider) StreamURL(context.Context, *model.File) (string, error) {
 	p.calls++
+	if p.err != nil {
+		return "", p.err
+	}
 	return "", fmt.Errorf("%w: too many requests", debrid.ErrRateLimited)
 }
 
@@ -589,7 +593,9 @@ func TestStreamerDoesNotRetryRateLimitedLinkImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := &rateLimitedLinkProvider{}
-	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, TTL: time.Hour}
+	var logs bytes.Buffer
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, TTL: time.Hour,
+		Log: slog.New(slog.NewJSONHandler(&logs, nil))}
 	recorder := httptest.NewRecorder()
 	streamer.Serve(recorder, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
 	if recorder.Code != http.StatusTooManyRequests {
@@ -597,6 +603,40 @@ func TestStreamerDoesNotRetryRateLimitedLinkImmediately(t *testing.T) {
 	}
 	if provider.calls != 1 {
 		t.Fatalf("expected one provider request, got %d", provider.calls)
+	}
+	for _, field := range []string{`"msg":"stream link request rate limited"`, `"level":"WARN"`, `"cooldown_scope":"link_generation"`, `"retry_after":"30"`} {
+		if !strings.Contains(logs.String(), field) {
+			t.Errorf("initial rate limit missing %s: %s", field, logs.String())
+		}
+	}
+}
+
+func TestStreamerLogsRateLimitWithoutProviderSecrets(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := &model.File{ID: "file", Path: "Movies/Test/Test.mkv", Provider: "test"}
+	if err := st.AddFiles(file); err != nil {
+		t.Fatal(err)
+	}
+	provider := &rateLimitedLinkProvider{err: debrid.NewRateLimitError("torbox requestdl", 90*time.Second,
+		"https://provider.example/download?token=private-token")}
+	var logs bytes.Buffer
+	streamer := &Streamer{Store: st, Providers: map[string]debrid.Provider{"test": provider}, TTL: time.Hour,
+		Log: slog.New(slog.NewJSONHandler(&logs, nil))}
+	w := httptest.NewRecorder()
+	streamer.Serve(w, httptest.NewRequest(http.MethodGet, "http://watchtower/file", nil), file)
+	if w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") != "90" || provider.calls != 1 {
+		t.Fatalf("rate limit: status=%d retry_after=%s calls=%d", w.Code, w.Header().Get("Retry-After"), provider.calls)
+	}
+	if !strings.Contains(logs.String(), `"msg":"stream link request rate limited"`) || !strings.Contains(logs.String(), `"retry_after":"90"`) {
+		t.Fatalf("missing initial rejection and cooldown: %s", logs.String())
+	}
+	for _, secret := range []string{"provider.example", "private-token"} {
+		if strings.Contains(logs.String(), secret) || strings.Contains(w.Body.String(), secret) {
+			t.Fatalf("provider details exposed in rate-limit diagnostic: %s %s", logs.String(), w.Body.String())
+		}
 	}
 }
 
